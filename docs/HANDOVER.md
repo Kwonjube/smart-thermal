@@ -5,7 +5,10 @@
 - **Relay:** 0.24, delivered. The owner deploys it; the website chat reviewed it and said "good to deploy".
 - **Demo:** live at `justifiedsystems.com.au/lab/smart-thermal/demo/` (0.24.0 build).
 
-The project is moving into a public GitHub repository, `smart-thermal` (owner's PC: `C:\Git\smart-thermal`). To start a new chat, give it this file and the repository (`SmartThermal/`, `relay/`, `tests/`, `docs/`, `README.md`, `SECURITY.md`).
+- **Repository:** `smart-thermal` on GitHub, published with GitHub Desktop; the owner is new to git (owner's PC: `C:\Git\smart-thermal`). First commit 24 Oct ("Smart Thermal 0.24.2", 122 files, includes the owner's `partitions.csv`). MIT licence (Justified Systems). The README has a clickable demo screenshot (`docs/images/demo.png`).
+- **Relay:** the first deploy from the repo moves `ADMIN_EMAIL`, `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD` to Worker secrets (`cd relay`, `npx wrangler deploy`, then three `npx wrangler secret put`). Check this was done before any other relay work.
+
+To start a new chat, give it this file and the repository.
 
 ---
 
@@ -45,7 +48,7 @@ The project is moving into a public GitHub repository, `smart-thermal` (owner's 
    - Keep the coverage and pacing figures per job, and the white tail at the end only.
 4. **Online drops.** The relay log shows "Printer's last drop: link closed without a goodbye" every 1–5 hours. Each reconnects within seconds. There was also one 504 (a status request took 90 s, so the relay closed the link). Watch only; no fix planned yet.
 5. **Printer stops answering after long idle (parked by the owner).** The owner believes the printer is at fault. As a test, the keep-awake now sends a phantom print (one white raster row, no cut) after 8 hours with no print.
-6. **`partitions.csv`.** The owner's old sketch folder has a custom one (579 bytes), which the Arduino IDE uses instead of the board's scheme. It must be copied into `SmartThermal/` in the repo. A copy was requested but never received.
+6. **`partitions.csv`.** Done: the owner's custom table (579 bytes) is committed in `SmartThermal/`. The Arduino IDE uses it instead of the board's scheme. Its contents were not reviewed here; check that it gives the app at least 1.7 MB.
 7. **Lend-out switch-over:** `BUILD_TRAINER 0`, `BUILD_BENCH 0`, then the acceptance tests (section 9). It saves only about 12 KB of flash.
 8. **Ideas for the owner to prioritise:** listed in section 14.
 
@@ -370,5 +373,5 @@ Serial menu: `W` forget Wi-Fi, `A` reprint the welcome slip, `M` memory ladder. 
 | 0.23.2 | 22 Oct | Preview and public demo generated from the page source; LAN addresses hidden online |
 | 0.24.0 | 22 Oct | Levels; Future/Level header buttons; demo strips home-only code |
 | 0.24.1 | 22 Oct | Welcome-slip loop fixed (QR first, logged, fallback); "device" wording; HOW TO USE rewritten; styled parts back to 48 KB |
-| 0.24.2 | 24 Oct | Repository ready to go public: neutral kiosk placeholder, portable tests, relay identifiers moved to secrets |
+| 0.24.2 | 24 Oct | Repository ready to go public: neutral kiosk placeholder, portable tests, relay identifiers moved to secrets, MIT licence, README demo screenshot |
 | Relay 0.23 / 0.23.1 / 0.24 | 21–22 Oct | Pause; admin Activity log; flood guard |

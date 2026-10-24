@@ -17,9 +17,11 @@ computer on the Wi-Fi, with no app and no account.
 - **Setup from paper.** A new unit prints a slip with a QR code to its own setup hotspot.
 - **Party kiosk.** A full-screen page for events.
 
-**Try it without hardware:** the public demo is at
-<https://justifiedsystems.com.au/lab/smart-thermal/demo/>. It runs the real page against a
-pretend printer.
+[![The Smart Thermal page on a phone: Basic, Advanced, and a list on the virtual paper. Click to open the live demo.](docs/images/demo.png)](https://justifiedsystems.com.au/lab/smart-thermal/demo/)
+
+**[▶ Try the live demo](https://justifiedsystems.com.au/lab/smart-thermal/demo/)**: the real
+page running against a pretend printer, in your browser. Nothing is printed, and no hardware
+is needed.
 
 ## Repository
 
@@ -74,3 +76,7 @@ the printer works on its own network as normal.
 
 See [SECURITY.md](SECURITY.md) for the security model, what is and is not protected, and how
 to report a problem.
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).
