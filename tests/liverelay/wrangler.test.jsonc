@@ -1,0 +1,8 @@
+{
+  "name": "print-relay-test",
+  "main": "src/index.js",
+  "compatibility_date": "2025-09-01",
+  "durable_objects": { "bindings": [{ "name": "RELAY", "class_name": "Relay" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Relay"] }],
+  "vars": { "PUBLIC_ORIGIN": "http://localhost:8787", "ADMIN_ORIGIN": "http://admin.invalid", "TEST_HOOKS": "1" }
+}

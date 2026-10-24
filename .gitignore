@@ -1,0 +1,51 @@
+# ---- Arduino / ESP32 build output (recreated on every build) ----
+build/
+*.bin
+*.elf
+*.map
+*.hex
+SmartThermal/build/
+
+# ---- Generated pages (rebuild: node SmartThermal/tools/build_pages.js) ----
+dist/
+
+# ---- Node / Cloudflare ----
+node_modules/
+.wrangler/
+.dev.vars
+.dev.vars.*
+.env
+.env.*
+!.env.example
+
+# ---- Test leftovers ----
+tests/out/
+tests/**/*.log
+tests/host/build/
+tests/relayhost/host_relay
+tests/relayhost/*.bin
+tests/sched_test
+tests/sched_test.exe
+*.pid
+.pid_*
+
+# ---- Never commit: device secrets, personal files, archives ----
+# (owner codes, Wi-Fi passwords and identity keys live only on each unit;
+#  these patterns are a safety net for copies made while debugging)
+*.pem
+*.key
+*secret*
+*.zip
+*.jpg
+*.jpeg
+*.png
+!tests/photo.jpg
+!docs/images/*.png
+
+# ---- Editors / OS ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

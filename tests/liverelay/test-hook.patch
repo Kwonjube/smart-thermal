@@ -1,0 +1,51 @@
+--- a/relay/src/index.js
++++ b/relay/src/index.js
+@@ -228,6 +228,11 @@
+     for (const h of ['x-relay-admin', 'x-relay-admin-host', 'x-relay-cf']) headers.delete(h); // never trust these from outside
+ 
+     if (path === '/robots.txt') return plain(200, 'User-agent: *\nDisallow: /');
++    // TEST COPY ONLY: approve without Cloudflare Access.
++    if (env.TEST_HOOKS === '1' && path.startsWith('/__test/')) {
++      headers.set('x-relay-test', '1');
++      return env.RELAY.get(env.RELAY.idFromName('relay')).fetch(new Request(request, { headers }));
++    }
+ 
+     if (host === hostOf(env.ADMIN_ORIGIN, 'admin.justifiedsystems.com.au')) {
+       if (!ADMIN_PATHS.includes(path)) return plain(404, 'Not found');
+@@ -388,6 +393,7 @@
+   async route(request) {
+     const url = new URL(request.url);
+     try {
++      if (this.env.TEST_HOOKS === '1' && request.headers.get('x-relay-test') === '1') return this.testHook(url);
+       if (request.headers.get('x-relay-admin-host') === '1') return await this.admin(request, url);
+       if (url.pathname === '/relay/connect') return await this.connect(request);
+       if (url.pathname.startsWith('/p/')) return await this.visitor(request, url);
+@@ -397,6 +403,28 @@
+     }
+   }
+ 
++  testHook(url) {
++    const id = url.searchParams.get('id');
++    const act = url.pathname.slice(8);
++    if (act === 'events') {
++      const rows = this.all('SELECT * FROM printers ORDER BY status, name');
++      return new Response(JSON.stringify({ events: this.all('SELECT * FROM events ORDER BY id'), html: this.activity(url, rows) }), { headers: { 'content-type': 'application/json' } });
++    }
++    for (const p of this.all('SELECT * FROM printers')) {
++      if (id && p.id !== id) continue;
++      if (act === 'approve' && (p.status === 'pending' || p.status === 'declined' || p.status === 'off')) {
++        this.sql.exec("UPDATE printers SET status = 'on', code = COALESCE(code, ?) WHERE id = ?", this.newCode(), p.id);
++        if (this.socketFor(p.id)) this.enqueueMsg(p.id, this.stateMsg(this.one('SELECT * FROM printers WHERE id = ?', p.id)));
++      }
++      if (act === 'decline' && p.status === 'pending') { this.sql.exec("UPDATE printers SET status = 'declined' WHERE id = ?", p.id); const ws = this.socketFor(p.id); if (ws) this.sendState(ws, { status: 'declined' }); }
++      if (act === 'off' && p.status === 'on') { this.sql.exec("UPDATE printers SET status = 'off' WHERE id = ?", p.id); const ws = this.socketFor(p.id); if (ws) { this.sendState(ws, { status: 'off' }); this.dropSocket(p.id, ws); } }
++      if (act === 'forget') { const ws = this.socketFor(p.id); if (ws) { try { ws.close(1000, 'Removed'); } catch {} this.dropSocket(p.id, ws); } this.sql.exec('DELETE FROM devices WHERE printer_id = ?', p.id); this.sql.exec('DELETE FROM printers WHERE id = ?', p.id); }
++    }
++    const rows = this.all('SELECT id, status, code, name, owner, mac, fw, visible, secure, owner_hash, prints_total FROM printers')
++      .map((p) => ({ ...p, online: !!this.socketFor(p.id) }));
++    return new Response(JSON.stringify(rows), { headers: { 'content-type': 'application/json' } });
++  }
++
+   // ------------------------------------------------------------ printer connection
+   async connect(request) {
+     if ((request.headers.get('upgrade') || '').toLowerCase() !== 'websocket') return plain(426, 'Expected a WebSocket.');

@@ -1,0 +1,13 @@
+{
+  "name": "smart-thermal-tests",
+  "private": true,
+  "description": "Browser tests for the Smart Thermal page against a pretend printer",
+  "scripts": {
+    "mock": "node mock.js",
+    "pages": "node ../SmartThermal/tools/build_pages.js && node pages_test.js && node levels_test.js",
+    "page": "node page_test.js && node draft_test.js && node v231_test.js && node v241_test.js"
+  },
+  "dependencies": {
+    "puppeteer-core": "^23.11.1"
+  }
+}

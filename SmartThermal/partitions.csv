@@ -1,0 +1,12 @@
+# SmartThermal partition table (v0.12.0). Arduino IDE uses this file
+# automatically because it sits in the sketch folder; the Partition Scheme
+# menu is then ignored.
+#
+# 4 MB flash: 1.75 MB for the firmware (it uses ~1.2 MB), 2.125 MB for
+# files - job history and the text reader (~1.9 MB). No OTA.
+# Name,   Type, SubType,  Offset,   Size,     Flags
+nvs,      data, nvs,      0x9000,   0x5000,
+otadata,  data, ota,      0xe000,   0x2000,
+app0,     app,  ota_0,    0x10000,  0x1C0000,
+spiffs,   data, spiffs,   0x1D0000, 0x220000,
+coredump, data, coredump, 0x3F0000, 0x10000,

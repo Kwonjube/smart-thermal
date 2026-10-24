@@ -1,0 +1,40 @@
+// Smart Thermal print relay: print.justifiedsystems.com.au
+// Deploy with:  npx wrangler deploy
+//
+// Three values are kept OUT of this public file, as Worker secrets (set once,
+// they survive every deploy):
+//   npx wrangler secret put ADMIN_EMAIL          the one email allowed into admin
+//   npx wrangler secret put ACCESS_TEAM_DOMAIN   <team>.cloudflareaccess.com
+//   npx wrangler secret put ACCESS_AUD           the Access application's AUD tag
+// Without them the admin page refuses everyone (fails closed).
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "print-relay",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-01",
+
+  // Only reachable on these two subdomains. No *.workers.dev or preview addresses, and the
+  // Worker itself refuses any other hostname.
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [
+    { "pattern": "print.justifiedsystems.com.au", "custom_domain": true },
+    { "pattern": "admin.justifiedsystems.com.au", "custom_domain": true }
+  ],
+
+  "durable_objects": {
+    "bindings": [{ "name": "RELAY", "class_name": "Relay" }]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Relay"] }
+  ],
+
+  "vars": {
+    "PUBLIC_ORIGIN": "https://print.justifiedsystems.com.au",   // printers and visitors
+    "ADMIN_ORIGIN": "https://admin.justifiedsystems.com.au",    // admin only, behind Cloudflare Access
+    "ADMIN_IDLE_SECONDS": "300"                                 // sign out after 5 minutes idle
+  },
+
+  // Minimal operational logging: no request logs are kept.
+  "observability": { "enabled": false }
+}
