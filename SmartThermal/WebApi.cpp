@@ -1,3 +1,5 @@
+#include "Mem.h"
+#include <esp_memory_utils.h>
 #include "WebApi.h"
 #include "Config.h"
 #include "WebUI.h"
@@ -6,10 +8,13 @@
 #include "WebUITheme.h"
 #include "WebUIFuture.h"
 #include "Online.h"
+#include "RasterZ.h"
 #include "LogPage.h"
 #include "Alerts.h"
 #include "KioskPage.h"
 #include <Preferences.h>
+#include <nvs_flash.h>
+#include "stqr.h"
 #include <ArduinoJson.h>
 #include <LittleFS.h>
 #include <WiFi.h>
@@ -34,12 +39,32 @@ void WebApi::begin(uint16_t port) {
   // (v0.20): such requests may print and use drafts, but not Settings.
   const char* wanted[] = { "Content-Type", "User-Agent", "X-Via-Relay" };
   _server.collectHeaders(wanted, 3);
+  {
+    Preferences p;
+    if (p.begin("unit", true)) { _storePrint = p.getBool("store", false); p.end(); }
+  }
 
   routes();
   _server.begin(port);
 }
 
-void WebApi::loop() { _server.handleClient(); }
+void WebApi::loop() {
+  _server.handleClient();
+
+  // The photo that the online link made room for has printed (or failed):
+  // give the next photo 10 s to arrive, then the link reconnects by itself.
+  static uint32_t lastCheck = 0;
+  if (_roomJob && millis() - lastCheck > 1000) {
+    lastCheck = millis();
+    StoredJob r;
+    if (_store.get(_roomJob, r) &&
+        (r.status == static_cast<uint8_t>(JobStatus::Done) ||
+         r.status == static_cast<uint8_t>(JobStatus::Failed))) {
+      Online::makeRoom(10000);
+      _roomJob = 0;
+    }
+  }
+}
 
 // ----------------------------------------------------------------------
 // Routing
@@ -72,11 +97,20 @@ void WebApi::routes() {
   _server.on("/api/print/raster",    HTTP_POST,
              [this]{ handlePrintRaster(); },
              [this]{ handleRasterUpload(); });
+  // Same handlers; the path tells them the body is compressed (v0.25).
+  _server.on("/api/print/rasterz",   HTTP_POST,
+             [this]{ handlePrintRaster(); },
+             [this]{ handleRasterUpload(); });
   _server.on("/api/print/raw",       HTTP_POST, [this]{ if (localOnly()) handlePrintRaw(); });
   _server.on("/api/jobs",            HTTP_GET,  [this]{ handleJobs(); });
   _server.on("/api/jobs/clear",      HTTP_POST, [this]{ if (localOnly()) handleJobsClear(); });
   _server.on("/api/system/reset",    HTTP_POST, [this]{ if (localOnly()) handleFactoryReset(); });
   _server.on("/api/system/reboot",   HTTP_POST, [this]{ if (localOnly()) handleReboot(); });
+  // v0.26: storage (print from storage switch, clear) and QR codes.
+  _server.on("/api/system/storage",  HTTP_GET,  [this]{ if (localOnly()) handleStorage(); });
+  _server.on("/api/system/storage",  HTTP_POST, [this]{ if (localOnly()) handleStorage(); });
+  _server.on("/api/system/storage/clear", HTTP_POST, [this]{ if (localOnly()) handleClearStorage(); });
+  _server.on("/api/qr.svg",          HTTP_GET,  [this]{ handleQr(); });
   _server.on("/log",     HTTP_GET, [this]{ if (localOnly()) _server.send_P(200, "text/html", LOG_PAGE); });
   _server.on("/log.txt", HTTP_GET, [this]{
     if (!localOnly()) return;
@@ -192,13 +226,13 @@ void WebApi::handleStatus() {
     sys["ip"]          = WiFi.localIP().toString();
     sys["rssi"]        = WiFi.RSSI();
   }
-  sys["freeHeap"]      = ESP.getFreeHeap();
-  sys["largestBlock"]  = ESP.getMaxAllocHeap();
+  sys["freeHeap"]      = Mem::free8();
+  sys["largestBlock"]  = Mem::block8();
   // An image needs ONE contiguous allocation, so the largest free block —
   // not total free heap — is the real ceiling. Reported with a margin so
   // the browser can warn before the upload fails.
   {
-    const size_t block = ESP.getMaxAllocHeap();
+    const size_t block = Mem::block8();
     // Online, the secure link to the website needs room of its own while a
     // photo arrives, so the margin is larger (v0.23.1).
     const size_t margin = (viaRelay() ? 24 : 12) * 1024;
@@ -207,6 +241,13 @@ void WebApi::handleStatus() {
     sys["maxImageBytes"] = usable;
   }
   sys["chunkRows"]     = _printer.rasterChunkRows();
+  sys["rasterz"]       = true;          // the page may send compressed images
+  sys["photoRoom"]     = photoRoom();   // what one image may hold now (v0.25)
+  sys["storePrint"]    = _storePrint;   // print from storage (v0.26)
+  if (_storePrint) {
+    const size_t t = LittleFS.totalBytes(), u = LittleFS.usedBytes();
+    sys["storeFree"] = u < t ? t - u : 0;
+  }
   sys["debug"]         = _queue.debug();
   sys["uptimeSec"]     = millis() / 1000;
 
@@ -410,6 +451,8 @@ void WebApi::handlePrintText() {
 void WebApi::resetRasterUpload() {
   free(_rasterBuf);
   _rasterBuf   = nullptr;
+  for (uint8_t i = 0; i < _rasterPieces.count; i++) Mem::release(_rasterPieces.buf[i]);
+  _rasterPieces = RasterPieces{};
   _rasterLen   = 0;
   _rasterCap   = 0;
   _rasterWidth = 0;
@@ -417,6 +460,13 @@ void WebApi::resetRasterUpload() {
   _rasterCoverage = 0;
   _rasterFail  = false;
   _rasterError[0] = 0;
+  _rasterZ = false;
+  _rasterZBytes = 0;
+  _rasterCode = 400;
+  if (_rasterFile) _rasterFile.close();
+  // A file this upload started is removed; one still queued is not ours.
+  if (_rasterFileMode && !_queue.photoBusy()) LittleFS.remove(PrintQueue::PHOTO_FILE);
+  _rasterFileMode = false;
 }
 
 // Runs repeatedly as the multipart body streams in. Geometry comes from the
@@ -456,31 +506,107 @@ void WebApi::handleRasterUpload() {
       return;
     }
 
-    const size_t need = static_cast<size_t>(_rasterWidth / 8) * _rasterRows;
-    if (need > MAX_RASTER_BYTES) {
+    size_t need = static_cast<size_t>(_rasterWidth / 8) * _rasterRows;
+    _rasterZ = _server.uri() == "/api/print/rasterz";
+    // A compressed image is never held decoded, so it may be far longer:
+    // only its compressed bytes need memory.
+    const bool toFile = _storePrint && !_rasterZ;
+    const size_t rawCap = (_rasterZ || toFile) ? MAX_RASTERZ_RAW : MAX_RASTER_BYTES;
+    if (need > rawCap) {
       _rasterFail = true;
       strlcpy(_rasterError, "image too tall", sizeof(_rasterError));
       return;
     }
+    // Compressed: the page says how many compressed bytes follow (z=). Only
+    // those are held; the decoded size is checked before the job is queued.
+    if (_rasterZ) {
+      _rasterZBytes = strtoul(_server.arg("z").c_str(), nullptr, 10);
+      if (!_rasterZBytes || _rasterZBytes > need + need / 8 + 64 || _rasterZBytes > MAX_RASTERZ_BYTES) {
+        _rasterFail = true;
+        strlcpy(_rasterError, "bad compressed size", sizeof(_rasterError));
+        return;
+      }
+      need = _rasterZBytes;
+    }
 
-    _rasterBuf = static_cast<uint8_t*>(malloc(need));
-    if (!_rasterBuf) {
+    // Print from storage (v0.26, Settings switch): streamed to a file in
+    // ~1.4 KB writes, so memory never limits it; storage does.
+    if (toFile) {
+      if (_queue.photoBusy()) {          // one stored image at a time
+        _rasterFail = true; _rasterCode = 503;
+        strlcpy(_rasterError, "queue full", sizeof(_rasterError));
+        return;
+      }
+      LittleFS.remove(PrintQueue::PHOTO_FILE);   // a leftover from a restart
+      const size_t t = LittleFS.totalBytes(), u = LittleFS.usedBytes();
+      if ((u < t ? t - u : 0) < need + 32 * 1024) {
+        _rasterFail = true; _rasterCode = 507;
+        strlcpy(_rasterError, "storage full - clear it in Settings", sizeof(_rasterError));
+        return;
+      }
+      _rasterFile = LittleFS.open(PrintQueue::PHOTO_FILE, "w");
+      if (!_rasterFile) {
+        _rasterFail = true; _rasterCode = 500;
+        strlcpy(_rasterError, "could not open storage", sizeof(_rasterError));
+        return;
+      }
+      _rasterFileMode = true;
+      _rasterCap = need;
+      return;
+    }
+
+    // Where the image waits (v0.24.11): the spare IRAM if it fits there
+    // alone; else one ordinary block, as in v0.18, if that leaves room for
+    // everything else; else IRAM plus ordinary pieces. Printed the same way
+    // whichever it is.
+    if (!allocRaster(need)) {
       _rasterFail = true;
-      snprintf(_rasterError, sizeof(_rasterError),
-               "out of memory (%u free)", (unsigned)ESP.getMaxAllocHeap());
+      // v0.24.7: on the home network, close the online link to free the
+      // ~40-50 KB it holds. The page retries in 3 s and then fits.
+      const bool room = !viaRelay() && Online::config().en;
+      if (room && !Online::makingRoom()) {
+        Log.printf("[raster] %u KB photo: no room (%uK free, %uK block) - "
+                   "closing the online link for it\n", (unsigned)(need / 1024),
+                   (unsigned)(Mem::free8() / 1024),
+                   (unsigned)(Mem::block8() / 1024));
+      }
+      if (room) Online::makeRoom(60000);
+      if (room)
+        strlcpy(_rasterError, "out of memory - making room", sizeof(_rasterError));
+      else
+        snprintf(_rasterError, sizeof(_rasterError),
+                 "out of memory (%uK free, iram %uK)",
+                 (unsigned)(Mem::free8() / 1024),
+                 (unsigned)(Mem::iramFree() / 1024));
       return;
     }
     _rasterCap = need;
 
   } else if (up.status == UPLOAD_FILE_WRITE) {
-    if (_rasterFail || !_rasterBuf) return;
+    if (_rasterFail) return;
+    if (_rasterFileMode) {
+      if (_rasterLen + up.currentSize > _rasterCap) {
+        _rasterFail = true;
+        strlcpy(_rasterError, "more data than declared", sizeof(_rasterError));
+        return;
+      }
+      if (_rasterFile.write(up.buf, up.currentSize) != up.currentSize) {
+        _rasterFail = true; _rasterCode = 507;
+        strlcpy(_rasterError, "storage write failed", sizeof(_rasterError));
+        return;
+      }
+      _rasterLen += up.currentSize;
+      return;
+    }
+    if (!_rasterBuf && !_rasterPieces.count) return;
 
     if (_rasterLen + up.currentSize > _rasterCap) {
       _rasterFail = true;
       strlcpy(_rasterError, "more data than declared", sizeof(_rasterError));
       return;
     }
-    memcpy(_rasterBuf + _rasterLen, up.buf, up.currentSize);
+    if (_rasterBuf) memcpy(_rasterBuf + _rasterLen, up.buf, up.currentSize);
+    else            _rasterPieces.put(_rasterLen, up.buf, up.currentSize);
     _rasterLen += up.currentSize;
   }
   // UPLOAD_FILE_END needs nothing: handlePrintRaster runs next and submits.
@@ -493,11 +619,27 @@ void WebApi::handlePrintRaster() {
     // sending the pointer afterwards gave the page {"error":""} (v0.23.1).
     char msg[sizeof(_rasterError)];
     strlcpy(msg, _rasterError[0] ? _rasterError : "upload failed", sizeof(msg));
+    const int code = _rasterCode;
     resetRasterUpload();
-    sendError(400, msg);
+    sendError(code, msg);
     return;
   }
-  if (!_rasterBuf || _rasterLen == 0) {
+  if (_rasterFileMode) {                       // print from storage (v0.26)
+    if (_rasterFile) _rasterFile.close();
+    if (!_rasterLen || _rasterLen != _rasterCap) { resetRasterUpload(); sendError(400, "upload incomplete"); return; }
+    char label[24];
+    const JobSource src = requestSource(label, sizeof(label));
+    const bool cut  = _server.arg("cut")  != "0";
+    const bool tail = _server.arg("tail") != "0";
+    const uint32_t id = _queue.submitRasterFile(PrintQueue::PHOTO_FILE, _rasterLen, _rasterWidth,
+                                                _rasterRows, src, cut, _rasterCoverage, tail);
+    _rasterFileMode = false;                   // the queue owns the file now
+    resetRasterUpload();
+    if (!id) { sendError(503, "queue full"); return; }
+    sendJobAccepted(id);
+    return;
+  }
+  if ((!_rasterBuf && !_rasterPieces.count) || _rasterLen == 0) {
     resetRasterUpload();
     sendError(400, "no image data");
     return;
@@ -516,26 +658,125 @@ void WebApi::handlePrintRaster() {
   char label[24];
   const JobSource src = requestSource(label, sizeof(label));
 
-  // Ownership passes to the queue here. Do not free _rasterBuf afterwards,
-  // and do not call resetRasterUpload() — just drop our references.
+  // Ownership passes to the queue here. Do not free _rasterBuf (or the
+  // pieces) afterwards, and do not call resetRasterUpload() — just drop our
+  // references.
   uint8_t* buf = _rasterBuf;
+  const RasterPieces pieces = _rasterPieces;
   const size_t   len   = _rasterLen;
   const uint16_t width = _rasterWidth;
   const uint16_t rows  = _rasterRows;
   const uint8_t  cov   = _rasterCoverage;
 
   _rasterBuf = nullptr;
+  _rasterPieces = RasterPieces{};
   _rasterLen = _rasterCap = 0;
   _rasterCoverage = 0;
 
   // tail=0: skip the white tail (templates are text-light; see
   // PrintQueue::tailRowsFor). Photos leave it on.
   const bool tail = _server.arg("tail") != "0";
-  const uint32_t id = _queue.submitRasterOwned(buf, len, width, rows, src,
-                                               cut, 0, cov, nullptr, 0, tail);
+  uint32_t id;
+  if (_rasterZ) {
+    // Check the whole compressed image decodes to exactly width x rows
+    // before it becomes a job: malformed, cut-short or oversized data is
+    // refused here, never found mid-print.
+    RasterPieces zp = pieces;
+    if (buf) { zp = RasterPieces{}; zp.buf[0] = buf; zp.len[0] = len; zp.count = 1; }
+    _rasterZ = false;
+    uint8_t* win = static_cast<uint8_t*>(malloc(RasterZ::WINDOW));
+    uint8_t zcov = 0;
+    const char* bad = win ? RasterZ::verify(zp, static_cast<size_t>(width / 8) * rows, win, &zcov)
+                          : "out of memory (decoder)";
+    free(win);
+    if (bad) {
+      for (uint8_t i = 0; i < zp.count; i++) Mem::release(zp.buf[i]);
+      sendError(400, bad);
+      return;
+    }
+    id = _queue.submitRasterPieces(zp, width, rows, src, cut, zcov, tail, true);
+  } else {
+    id = buf ? _queue.submitRasterOwned(buf, len, width, rows, src,
+                                        cut, 0, cov, nullptr, 0, tail)
+             : _queue.submitRasterPieces(pieces, width, rows, src, cut, cov, tail);
+  }
+  // Room was made for this photo: keep the link closed until it has
+  // printed (10 min at most); loop() then lets it reconnect.
+  if (id && !viaRelay() && Online::makingRoom()) {
+    _roomJob = id;
+    Online::makeRoom(600000);
+  }
   if (!id) { sendError(503, "queue full"); return; }
 
   sendJobAccepted(id);
+}
+
+// Takes room for `need` bytes of image, measured in memory that malloc can
+// really give (Mem.h). Ordinary free memory never falls below KEEP_FREE
+// (the online link, Wi-Fi, replies and the log need it).
+//   1. Pure IRAM alone, if it fits: 32-bit access only, otherwise idle.
+//   2. One ordinary block (_rasterBuf), as in v0.18.
+//   3. Pure IRAM first, then ordinary pieces, biggest block first.
+// All or nothing: on failure everything taken is given back.
+bool WebApi::allocRaster(size_t need) {
+  auto addIram = [this](size_t want) -> size_t {
+    const size_t sz = want < Mem::iramFree() ? want : Mem::iramFree();
+    uint8_t* p = sz >= 4096 || sz == want ? Mem::iramTake(sz) : nullptr;
+    if (!p) return 0;
+    const uint8_t i = _rasterPieces.count;
+    _rasterPieces.buf[i] = p;
+    _rasterPieces.len[i] = sz;
+    _rasterPieces.word |= 1u << i;           // pure IRAM: 32-bit access only
+    _rasterPieces.count++;
+    return sz;
+  };
+  auto giveBack = [this]() {
+    for (uint8_t i = 0; i < _rasterPieces.count; i++) Mem::release(_rasterPieces.buf[i]);
+    _rasterPieces = RasterPieces{};
+  };
+
+  // 1. Pure IRAM alone.
+  if (need <= Mem::iramFree() && addIram(need) == need) return true;
+  giveBack();
+
+  // 2. One ordinary block that still leaves KEEP_FREE.
+  if (Mem::block8() >= need + 64 && Mem::free8() >= need + KEEP_FREE) {
+    _rasterBuf = static_cast<uint8_t*>(malloc(need));
+    if (_rasterBuf && Mem::free8() >= KEEP_FREE) return true;
+    free(_rasterBuf);
+    _rasterBuf = nullptr;
+  }
+
+  // 3. Pure IRAM, then ordinary pieces.
+  size_t left = need;
+  left -= addIram(left);
+  while (left && _rasterPieces.count < RasterPieces::MAX) {
+    const size_t freeNow = Mem::free8();
+    if (freeNow <= KEEP_FREE + 1024) break;
+    const size_t budget = freeNow - KEEP_FREE - 1024;  // headers and slack
+    const size_t block  = Mem::block8();
+    size_t take = block > 1024 ? block - 1024 : 0;
+    if (take > budget) take = budget;
+    if (take > left)   take = left;
+    if (!take || (take < 1024 && take < left)) break;  // no crumbs
+    uint8_t* p = static_cast<uint8_t*>(malloc(take));
+    if (!p) break;
+    _rasterPieces.buf[_rasterPieces.count] = p;
+    _rasterPieces.len[_rasterPieces.count] = take;
+    _rasterPieces.count++;
+    left -= take;
+  }
+
+  if (left || Mem::free8() < KEEP_FREE) { giveBack(); return false; }
+  return true;
+}
+
+// Roughly how big one held image (compressed, for /api/print/rasterz) may be
+// right now, for the page to warn before sending (v0.25). Through the
+// website the request itself holds ~24 KB while it arrives.
+size_t WebApi::photoRoom() {
+  const size_t f = Mem::free8(), extra = KEEP_FREE + (viaRelay() ? 24 * 1024 : 0);
+  return Mem::iramFree() + (f > extra ? f - extra : 0);
 }
 
 void WebApi::handlePrintRaw() {
@@ -636,10 +877,79 @@ void WebApi::handleJobsClear() {
   sendJson(200, "{\"cleared\":true}");
 }
 
+// Factory reset (v0.26): everything, as new. All saved settings (Wi-Fi,
+// printer, online identity, kiosk, themes, profiles) are erased with the
+// whole NVS partition, and storage is formatted on the way back up. The
+// unit restarts into setup and, with a new identity key, joins the website
+// as a new device.
 void WebApi::handleFactoryReset() {
-  _settings.factoryReset();
-  Online::forget();                  // a new identity: approval needed again
-  sendJson(200, "{\"reset\":true,\"rebootRequired\":true}");
+  Log.println("[reset] factory reset - erasing everything and restarting into setup");
+  Log.save(true);
+  sendJson(200, "{\"reset\":true,\"rebooting\":true}");
+  delay(400);
+  nvs_flash_deinit();
+  nvs_flash_erase();
+  nvs_flash_init();
+  { Preferences p; if (p.begin("unit", false)) { p.putBool("fmt", true); p.end(); } }
+  ESP.restart();
+}
+
+// Clear storage (v0.26): formats LittleFS on the next start (nothing is
+// open then), keeping every setting. Drafts, saved and scheduled prints,
+// the stored picture, history and the saved log go.
+void WebApi::handleClearStorage() {
+  Log.println("[storage] clear requested - formatting on restart");
+  { Preferences p; if (p.begin("unit", false)) { p.putBool("fmt", true); p.end(); } }
+  sendJson(200, "{\"cleared\":true,\"rebooting\":true}");
+  delay(400);
+  ESP.restart();
+}
+
+void WebApi::handleStorage() {
+  if (_server.method() == HTTP_POST) {
+    JsonDocument in;
+    if (deserializeJson(in, body())) { sendError(400, "invalid json"); return; }
+    if (in["printFromStorage"].is<bool>()) {
+      _storePrint = in["printFromStorage"];
+      Preferences p;
+      if (p.begin("unit", false)) { p.putBool("store", _storePrint); p.end(); }
+      Log.printf("[storage] print from storage %s\n", _storePrint ? "on" : "off");
+    }
+  }
+  const size_t t = LittleFS.totalBytes(), u = LittleFS.usedBytes();
+  JsonDocument doc;
+  doc["printFromStorage"] = _storePrint;
+  doc["total"] = t; doc["used"] = u; doc["free"] = u < t ? t - u : 0;
+  String out; serializeJson(doc, out);
+  sendJson(200, out);
+}
+
+// A QR code as SVG, for the links the page shows (v0.26). Through the
+// website too (the owner's approval page shows one). Text up to 200 chars.
+void WebApi::handleQr() {
+  const String t = _server.arg("t");
+  if (t.isEmpty() || t.length() > 200) { sendError(400, "text missing or too long"); return; }
+  uint8_t qr[stqr_BUFFER_LEN_FOR_VERSION(10)], tmp[stqr_BUFFER_LEN_FOR_VERSION(10)];
+  if (!stqr_encodeText(t.c_str(), tmp, qr, stqr_Ecc_MEDIUM, 1, 10, stqr_Mask_AUTO, true)) {
+    sendError(400, "too long for a QR code"); return;
+  }
+  const int n = stqr_getSize(qr), q = 4, w = n + 2 * q;
+  String svg;
+  svg.reserve(4096);
+  svg += "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 ";
+  svg += w; svg += ' '; svg += w;
+  svg += "\" shape-rendering=\"crispEdges\"><rect width=\"100%\" height=\"100%\" fill=\"#fff\"/><path fill=\"#000\" d=\"";
+  for (int y = 0; y < n; y++)
+    for (int x = 0; x < n; ) {
+      if (!stqr_getModule(qr, x, y)) { x++; continue; }
+      int e = x; while (e < n && stqr_getModule(qr, e, y)) e++;
+      svg += 'M'; svg += x + q; svg += ' '; svg += y + q;
+      svg += 'h'; svg += e - x; svg += "v1h-"; svg += e - x; svg += 'z';
+      x = e;
+    }
+  svg += "\"/></svg>";
+  _server.sendHeader("Cache-Control", "max-age=86400");
+  _server.send(200, "image/svg+xml", svg);
 }
 
 void WebApi::handleReboot() {

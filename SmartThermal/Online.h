@@ -61,6 +61,14 @@ namespace Online {
   void   newLink();             // asks the relay for a new code
   void   newOwnerCode();
 
+  // Room for a home photo (v0.24.7). The secure link holds ~40-50 KB and
+  // splits free memory, so a 60+ KB photo cannot be held while it is up.
+  // makeRoom() closes the link and keeps it closed for up to ms (or until
+  // extended or released); it then reconnects by itself. Home network only:
+  // an online request arrives through the link and cannot close it.
+  void   makeRoom(uint32_t ms);
+  bool   makingRoom();
+
   // From the slip desk, once the welcome slip is on paper.
   void   welcomed(const char* key);
 }

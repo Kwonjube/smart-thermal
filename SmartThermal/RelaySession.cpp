@@ -253,7 +253,11 @@ bool RelaySession::handleText(char* s, size_t n, End& end) {
     return true;
   }
   if (!strcmp(t, "notice")) {
-    _h.onNotice(doc["k"] | "", doc["name"] | "");
+    _h.onNotice2(doc["k"] | "", doc["name"] | "", doc["dev"] | "", doc["loc"] | "");
+    return true;
+  }
+  if (!strcmp(t, "owner")) {                             // v0.26
+    if (!strcmp(doc["a"] | "", "off")) { _h.onOwnerOff(); }
     return true;
   }
   if (!strcmp(t, "req")) return forward(doc.as<JsonObjectConst>());

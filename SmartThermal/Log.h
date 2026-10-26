@@ -37,6 +37,9 @@ public:
   // running. Call enableSave() once LittleFS is mounted, and save() from
   // loop() - it writes at most every 30 s, or sooner past 4 KB.
   void enableSave() { _save = true; }
+  // While an image streams from storage, routine saves wait, so a flash
+  // write never stalls it mid-print (v0.26). save(true) still runs.
+  void hold(bool on) { _hold = on; }
   void save(bool now = false);
   static const char* SAVED;
   static const char* SAVED_OLD;
@@ -44,6 +47,7 @@ public:
 private:
   size_t raw(const uint8_t* buf, size_t len);   // no timestamping
   bool     _save = false;
+  volatile bool _hold = false;
   uint32_t _savedAt = 0;
 };
 

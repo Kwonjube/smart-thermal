@@ -75,6 +75,14 @@ void EscPos::rasterBitImage(RasterMode mode,
                             uint16_t rows,
                             const uint8_t* data,
                             size_t len) {
+  // Header and pixels must both land in full. If the header goes and the
+  // pixels are cut short, the printer is left waiting mid-image and reads
+  // whatever follows as image data.
+  if (!rasterHeader(mode, widthBytes, rows)) return;
+  if (data && len) _t.writeAll(data, len);
+}
+
+bool EscPos::rasterHeader(RasterMode mode, uint16_t widthBytes, uint16_t rows) {
   const uint8_t header[8] = {
     GS, 'v', '0',
     static_cast<uint8_t>(mode),
@@ -84,11 +92,7 @@ void EscPos::rasterBitImage(RasterMode mode,
     static_cast<uint8_t>((rows >> 8) & 0xFF)
   };
 
-  // Header and pixels must both land in full. If the header goes and the
-  // pixels are cut short, the printer is left waiting mid-image and reads
-  // whatever follows as image data.
-  if (!_t.writeAll(header, sizeof(header))) return;
-  if (data && len) _t.writeAll(data, len);
+  return _t.writeAll(header, sizeof(header));
 }
 
 void EscPos::rasterBlank(uint16_t widthBytes, uint16_t rows) {

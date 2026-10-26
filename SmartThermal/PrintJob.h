@@ -5,6 +5,7 @@
 // task must not touch it again — the printer task owns it and frees it.
 
 #pragma once
+#include "RasterPieces.h"
 #include <Arduino.h>
 #include <IPAddress.h>
 
@@ -74,6 +75,15 @@ struct PrintJob {
   uint8_t  pre[8];       // raster: raw commands sent after the job's ESC @
   uint8_t  preLen;       //   (bench tests; a separate job would be reset)
   bool     noTail;       // raster: skip the white tail (bench, raw panels)
+  // raster: held in pieces when no single block was big enough (v0.24.6).
+  // payload is then null. Printed as exactly the same commands.
+  RasterPieces pieces;
+  // raster: the pixels are in this LittleFS file, not in memory (print from
+  // storage, Settings switch, v0.26). payload is null.
+  char     file[20];
+  // Compressed image (v0.25): pieces hold Heatshrink-compressed
+  // pixels (payloadLen = compressed bytes; rows x rowBytes when decoded).
+  bool     packedZ;
 
   // Raster options
   uint16_t widthDots;

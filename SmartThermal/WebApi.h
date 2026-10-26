@@ -14,6 +14,7 @@
 #include <WebServer.h>
 #include "Settings.h"
 #include "PrintQueue.h"
+#include "RasterPieces.h"
 #include "JobStore.h"
 #include "Printer.h"
 #include "Transport.h"
@@ -56,8 +57,16 @@ private:
   // limit - memory is. /api/printer/status reports maxImageBytes from the
   // largest free block (minus a margin), and that is what the page uses.
   static const size_t MAX_RASTER_BYTES = 128 * 1024;
+  // Compressed images (v0.25): only the compressed
+  // bytes are held, so the decoded image may be much longer. The relay's
+  // body limit is 160 KB; 150 KB leaves room for the multipart wrapping.
+  static const size_t MAX_RASTERZ_RAW   = 512 * 1024;   // ~910 mm at full width
+  static const size_t MAX_RASTERZ_BYTES = 150 * 1024;
 
   uint8_t* _rasterBuf   = nullptr;
+  // v0.24.6: used instead of _rasterBuf when no single block is big enough
+  // (the online link leaves ~95 KB free but no block over ~45-53 KB).
+  RasterPieces _rasterPieces{};
   size_t   _rasterLen   = 0;
   size_t   _rasterCap   = 0;
   uint16_t _rasterWidth = 0;
@@ -69,6 +78,22 @@ private:
   char     _rasterError[40] = {0};
 
   void resetRasterUpload();
+  bool allocRaster(size_t need);     // v0.24.11: IRAM, one block or pieces
+  size_t photoRoom();                // for status: room for one held image
+  static const size_t KEEP_FREE = 16 * 1024;   // ordinary memory always left free
+  // v0.24.7: the home photo printing while the online link is closed to make
+  // room for it. loop() reopens the link (after 10 s) once it has finished.
+  uint32_t _roomJob = 0;
+  // This upload is /api/print/rasterz (v0.25), so
+  // the buffer holds _rasterZBytes of compressed pixels (RasterZ.h).
+  bool     _rasterZ = false;
+  // Print from storage (Settings switch, v0.26, off by default): an
+  // uncompressed image streams to PrintQueue::PHOTO_FILE instead of memory.
+  bool     _storePrint = false;   // the switch (NVS unit/store)
+  bool     _rasterFileMode = false; // this upload goes to storage
+  File     _rasterFile;
+  int      _rasterCode = 400;     // HTTP status for _rasterError
+  size_t   _rasterZBytes = 0;
 
   // --- Drafts, saved, scheduled (WebApiItems.cpp) -------------------------
   ItemStore* _items = nullptr;
@@ -114,6 +139,9 @@ private:
   void handleJobsClear();
   void handleFactoryReset();
   void handleReboot();
+  void handleStorage();            // GET/POST /api/system/storage (v0.26)
+  void handleClearStorage();       // POST /api/system/storage/clear
+  void handleQr();                 // GET /api/qr.svg?t= (v0.26)
   void handleNotFound();
 
   // Helpers

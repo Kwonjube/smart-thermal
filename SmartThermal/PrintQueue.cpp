@@ -1,5 +1,8 @@
+#include "Mem.h"
 #include "Log.h"
 #include "PrintQueue.h"
+#include "RasterZ.h"
+#include "Config.h"
 #include "Discovery.h"
 #include <time.h>
 
@@ -236,6 +239,18 @@ uint8_t PrintQueue::coverageOf(const PrintJob* job) const {
 
   if (job->type == JobType::Raster) {
     if (job->coverage) return job->coverage > 100 ? 100 : job->coverage;
+    if (job->packedZ) return 0;      // counted when it was verified: truly blank
+    if (job->file[0]) return countCoverageFile(job->file);
+    if (job->pieces.count) {
+      uint64_t set = 0, bytes = 0;
+      job->pieces.each(0, job->payloadLen, [&](const uint8_t* p, size_t n) {
+        for (size_t i = 0; i < n; i++) set += __builtin_popcount(p[i]);
+        bytes += n;
+      });
+      if (!bytes) return 0;
+      const uint64_t bits = bytes * 8ULL;
+      return static_cast<uint8_t>((set * 100ULL + bits / 2) / bits);
+    }
     return countCoverage(job->payload, job->payloadLen);
   }
 
@@ -577,8 +592,8 @@ void PrintQueue::maybeHeartbeat() {
     "queue %u pending %lu done %lu failed %lu faults | last %lu KB/s | "
     "pace %u%% cov, %lu+%lu ms%s\n",
     (unsigned long)(now / 1000),
-    (unsigned long)ESP.getFreeHeap(),
-    (unsigned long)ESP.getMaxAllocHeap(),
+    (unsigned long)Mem::free8(),
+    (unsigned long)Mem::block8(),
     !_probing ? "NOT PROBED (quiet)"
               : cooling ? "COOLING" : (_reachable ? "reachable" : "UNREACHABLE"),
     (unsigned)pending(),
@@ -764,6 +779,70 @@ uint32_t PrintQueue::submitRasterOwned(uint8_t* data, size_t len,
   return id;
 }
 
+uint32_t PrintQueue::submitRasterPieces(const RasterPieces& pieces,
+                                        uint16_t widthDots, uint16_t rows,
+                                        const JobSource& source, bool cut,
+                                        uint8_t coverage, bool tail,
+                                        bool packedZ) {
+  const uint16_t rowBytes = (widthDots + 7) / 8;
+  const size_t   len      = pieces.total();
+  auto drop = [&pieces]() {
+    for (uint8_t i = 0; i < pieces.count; i++) Mem::release(pieces.buf[i]);
+  };
+  // A compressed image (experiment) was checked whole by RasterZ::verify
+  // before it got here; its length is the compressed size.
+  if (!pieces.count || pieces.count > RasterPieces::MAX || !rows || !widthDots ||
+      (!packedZ && len != static_cast<size_t>(rowBytes) * rows)) {
+    drop();
+    return 0;
+  }
+
+  PrintJob* job = allocJob(JobType::Raster, nullptr, 0, source);
+  if (!job) { drop(); return 0; }
+
+  job->pieces     = pieces;         // adopted, not copied
+  job->packedZ    = packedZ;
+  job->payloadLen = len;
+  job->widthDots  = widthDots;
+  job->rows       = rows;
+  job->cut        = cut;
+  job->chunkRows  = 0;
+  job->coverage   = coverage > 100 ? 100 : coverage;
+  job->noTail     = !tail;
+
+  // enqueue() frees the job (and its pieces) if the queue was full.
+  return enqueue(job);
+}
+
+uint32_t PrintQueue::submitRasterFile(const char* path, size_t len,
+                                      uint16_t widthDots, uint16_t rows,
+                                      const JobSource& source, bool cut,
+                                      uint8_t coverage, bool tail) {
+  const uint16_t rowBytes = (widthDots + 7) / 8;
+  if (!path || !*path || strlen(path) >= sizeof(PrintJob::file) ||
+      !rows || !widthDots || len != static_cast<size_t>(rowBytes) * rows) {
+    if (path && *path) LittleFS.remove(path);
+    return 0;
+  }
+
+  PrintJob* job = allocJob(JobType::Raster, nullptr, 0, source);
+  if (!job) { LittleFS.remove(path); return 0; }
+
+  strlcpy(job->file, path, sizeof(job->file));
+  job->payloadLen = len;
+  job->widthDots  = widthDots;
+  job->rows       = rows;
+  job->cut        = cut;
+  job->chunkRows  = 0;
+  job->coverage   = coverage > 100 ? 100 : coverage;
+  job->noTail     = !tail;
+
+  _photoBusy = true;
+  // enqueue() frees the job if the queue is full, which deletes the file
+  // and clears _photoBusy (freeJob).
+  return enqueue(job);
+}
+
 uint32_t PrintQueue::submitRaw(const uint8_t* data, size_t len,
                                const JobSource& source) {
   PrintJob* job = allocJob(JobType::Raw, data, len, source);
@@ -774,6 +853,11 @@ uint32_t PrintQueue::submitRaw(const uint8_t* data, size_t len,
 
 void PrintQueue::freeJob(PrintJob* job) {
   if (!job) return;
+  if (job->file[0]) {                 // a stored image: its file goes with it
+    LittleFS.remove(job->file);
+    _photoBusy = false;
+  }
+  for (uint8_t i = 0; i < job->pieces.count; i++) Mem::release(job->pieces.buf[i]);
   free(job->payload);
   free(job);
 }
@@ -1064,7 +1148,7 @@ bool PrintQueue::renderText(PrintJob* job, StoredJob& rec) {
 }
 
 bool PrintQueue::renderRaster(PrintJob* job, StoredJob& rec) {
-  if (!job->payload) return false;
+  if (!job->payload && !job->pieces.count && !job->file[0]) return false;
 
   if (job->widthDots > _printer->printableDots()) {
     strlcpy(rec.error, "image wider than paper", sizeof(rec.error));
@@ -1082,20 +1166,112 @@ bool PrintQueue::renderRaster(PrintJob* job, StoredJob& rec) {
                   job->widthDots, job->rows, chunkRows,
                   commands, commands == 1 ? "" : "s");
 
+  // A compressed image (v0.25): decoded here, 1 KB at a time, through a
+  // 2 KB window, straight into the same commands. A reprint decodes again
+  // from the start, because the job keeps the compressed bytes.
+  uint8_t* zwin = nullptr;
+  RasterZ::Decoder zdec;
+  if (job->packedZ) {
+    zwin = static_cast<uint8_t*>(malloc(RasterZ::WINDOW + 1024));
+    if (!zwin) {
+      strlcpy(rec.error, "out of memory (decoder)", sizeof(rec.error));
+      return false;
+    }
+    zdec.begin(job->pieces, zwin);
+  }
+
+  // A stored image (print from storage, v0.26): opened and checked before
+  // a byte is sent, so a missing file fails the job cleanly.
+  File photo;
+  uint8_t* pbuf = nullptr;
+  size_t   pcap = 0;
+  if (job->file[0]) {
+    photo = LittleFS.open(job->file, "r");
+    if (!photo || photo.size() != job->payloadLen) {
+      free(zwin);
+      strlcpy(rec.error, "stored image missing", sizeof(rec.error));
+      return false;
+    }
+    // Whole rows, about 8 KB per read: small next to the printer's ~18 KB
+    // buffer, so a read never leaves it short.
+    pcap = static_cast<size_t>(rowBytes) * max<uint16_t>(1, 8192 / rowBytes);
+    pbuf = static_cast<uint8_t*>(malloc(pcap));
+    if (!pbuf) {
+      free(zwin);
+      strlcpy(rec.error, "out of memory", sizeof(rec.error));
+      return false;
+    }
+    Log.hold(true);                    // no log write to flash mid-image
+  }
+
   if (job->preLen) _printer->escpos().raw(job->pre, job->preLen);
   _printer->align(Align::Center);
   _printer->link().resetGaps();
 
   for (uint16_t y = 0; y < job->rows; y += chunkRows) {
     const uint16_t rows = min<uint16_t>(chunkRows, job->rows - y);
-    const uint8_t* band = job->payload + static_cast<size_t>(y) * rowBytes;
 
-    if (!_raster->printBand(band, job->widthDots, rows)) {
-      strlcpy(rec.error, "raster band rejected", sizeof(rec.error));
-      return false;
+    if (job->packedZ) {
+      if (!_printer->ok() || job->widthDots > _printer->printableDots() ||
+          !_printer->escpos().rasterHeader(RasterMode::Normal, rowBytes, rows)) {
+        free(zwin);
+        strlcpy(rec.error, "raster band rejected", sizeof(rec.error));
+        return false;
+      }
+      // The header promised rows x rowBytes: send exactly that, padding with
+      // white if decoding fails, so the printer never waits mid-command.
+      uint8_t* zout = zwin + RasterZ::WINDOW;
+      size_t   left = static_cast<size_t>(rows) * rowBytes;
+      bool     zok  = true;
+      while (left) {
+        const size_t want = left < 1024 ? left : 1024;
+        const size_t got  = zok ? zdec.read(zout, want) : 0;
+        if (got < want) { zok = false; memset(zout + got, 0, want - got); }
+        _printer->escpos().raw(zout, want);
+        left -= want;
+      }
+      if (!zok) {
+        free(zwin);
+        strlcpy(rec.error, "compressed image damaged", sizeof(rec.error));
+        return false;
+      }
+      rec.bytes += static_cast<uint32_t>(rowBytes) * rows + 8;
+      continue;
+    }
+    if (pbuf) {
+      if (!streamBandFromFile(photo, pbuf, pcap, rowBytes, rows, rec)) {
+        free(pbuf);
+        Log.hold(false);
+        return false;
+      }
+      rec.bytes += static_cast<uint32_t>(rowBytes) * rows + 8;
+      continue;
+    }
+    if (job->pieces.count) {
+      // Held in pieces (v0.24.6): the same command, header then its rows,
+      // the rows read from whichever pieces hold them.
+      if (!_printer->ok() || job->widthDots > _printer->printableDots() ||
+          !_printer->escpos().rasterHeader(RasterMode::Normal, rowBytes, rows)) {
+        strlcpy(rec.error, "raster band rejected", sizeof(rec.error));
+        return false;
+      }
+      job->pieces.each(static_cast<size_t>(y) * rowBytes,
+                       static_cast<size_t>(rows) * rowBytes,
+                       [this](const uint8_t* p, size_t n) {
+                         _printer->escpos().raw(p, n);
+                       });
+    } else {
+      const uint8_t* band = job->payload + static_cast<size_t>(y) * rowBytes;
+      if (!_raster->printBand(band, job->widthDots, rows)) {
+        strlcpy(rec.error, "raster band rejected", sizeof(rec.error));
+        return false;
+      }
     }
     rec.bytes += static_cast<uint32_t>(rowBytes) * rows + 8;
   }
+
+  free(zwin);
+  if (pbuf) { free(pbuf); Log.hold(false); }
 
   // The white tail. Fixes the step to lighter near the end of photos.
   const uint16_t tail = job->noTail ? 0 : tailRowsFor(job->widthDots, job->rows);
@@ -1161,6 +1337,55 @@ uint16_t PrintQueue::tailRowsFor(uint16_t widthDots, uint16_t rows) const {
   if (tailMm < 0) tailMm = 0;
   tailMm += 4.0f;
   return static_cast<uint16_t>(tailMm * 8.0f + 0.5f);
+}
+
+// One GS v 0 command whose pixels come from the stored photo, read in
+// pieces of whole rows. The header promises rowBytes x rows bytes, so if
+// the file runs short the rest is sent as white: the printer must never be
+// left waiting mid-command (it would read the next job as pixels).
+bool PrintQueue::streamBandFromFile(File& f, uint8_t* buf, size_t cap,
+                                    uint16_t rowBytes, uint16_t rows,
+                                    StoredJob& rec) {
+  if (!_printer->ok()) {
+    strlcpy(rec.error, "raster band rejected", sizeof(rec.error));
+    return false;
+  }
+  if (!_printer->escpos().rasterHeader(RasterMode::Normal, rowBytes, rows)) {
+    strlcpy(rec.error, "raster band rejected", sizeof(rec.error));
+    return false;
+  }
+  size_t left = static_cast<size_t>(rowBytes) * rows;
+  bool   ok   = true;
+  while (left) {
+    const size_t want = left < cap ? left : cap;
+    size_t got = ok ? f.read(buf, want) : 0;
+    if (got != want) {
+      if (ok) strlcpy(rec.error, "stored photo could not be read", sizeof(rec.error));
+      ok = false;
+      memset(buf + got, 0, want - got);   // pad with white, keep in step
+    }
+    _printer->escpos().raw(buf, want);
+    left -= want;
+  }
+  return ok;
+}
+
+// Coverage of a stored photo, counted in pieces (only when the page did
+// not send one).
+uint8_t PrintQueue::countCoverageFile(const char* path) {
+  File f = LittleFS.open(path, "r");
+  if (!f || !f.size()) return 0;
+  uint8_t  buf[512];
+  uint64_t set = 0, bytes = 0;
+  for (;;) {
+    const size_t n = f.read(buf, sizeof(buf));
+    if (!n) break;
+    for (size_t i = 0; i < n; i++) set += __builtin_popcount(buf[i]);
+    bytes += n;
+  }
+  if (!bytes) return 0;
+  const uint64_t bits = bytes * 8ULL;
+  return static_cast<uint8_t>((set * 100ULL + bits / 2) / bits);
 }
 
 bool PrintQueue::renderRaw(PrintJob* job, StoredJob& rec) {

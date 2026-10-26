@@ -46,8 +46,12 @@ ${fs.readFileSync(path.join(__dirname, 'fakeunit.js'), 'utf8')}
   let online = CFG.demo;
   if (!CFG.demo) { try { online = new URLSearchParams(location.search).get('view') === 'online'; } catch (e) {} }
   window.SHOW_AS_ONLINE = online;
+  // QR codes are drawn by the printer; here a stand-in square says so.
+  window.qrSrc = t => 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40">'
+    + '<rect width="40" height="40" fill="#fff"/><rect x="3" y="3" width="10" height="10" fill="#000"/><rect x="27" y="3" width="10" height="10" fill="#000"/>'
+    + '<rect x="3" y="27" width="10" height="10" fill="#000"/><text x="20" y="24" font-size="6" text-anchor="middle" font-family="sans-serif">QR</text></svg>');
   const papers = [];
-  const unit = FakeUnit.createUnit({ version: CFG.version, hostname: 'print', remote: online, demo: CFG.demo, home: CFG.home,
+  const unit = FakeUnit.createUnit({ version: CFG.version, hostname: 'print', remote: online, demo: CFG.demo, home: CFG.home, rasterz: !CFG.demo,
     onPrint: (p) => { papers.push(p); window.dispatchEvent(new Event('fake-print')); } });
   window.__fakeUnit = unit;
 

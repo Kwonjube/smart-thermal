@@ -35,7 +35,10 @@ public:
   void wantSetupFailed(const char* ssid, const char* why);
   void wantOnline(const char* name, const char* url, const char* ownerCode,
                   bool secure, bool visible, const char* key);
-  void wantKnock(const char* who, const char* printer, const char* url);
+  // dev / loc (v0.26): the asking device and its rough location, from the
+  // website (shown to the visitor as "Information collected").
+  void wantKnock(const char* who, const char* printer, const char* url,
+                 const char* dev = "", const char* loc = "");
   bool busy(Kind k) const { return _state[k] != IDLE; }
 
   // Submits and confirms. Call every loop.
@@ -61,6 +64,7 @@ private:
   char _oName[33] = {0}, _oUrl[96] = {0}, _oCode[8] = {0}, _oKey[24] = {0};
   bool _oSec = false, _oVis = false;
   char _kWho[33] = {0}, _kName[33] = {0}, _kUrl[96] = {0};
+  char _kDev[48] = {0}, _kLoc[64] = {0};
 
   static const uint32_t RETRY_MS = 30000;
   // After this many failed tries a slip prints without its QR code (the

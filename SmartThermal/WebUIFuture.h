@@ -213,7 +213,8 @@ static const char WEB_UI_FUTURE[] PROGMEM = R"HTML(
       if (ghost) x.className = 'ghost'; x.onclick = fn; r.appendChild(x); };
     if (kind === 's') btn('Print', () => quickPrint(it));
     if (kind === 'd') { btn(link && link.id === it.id ? 'Open \u2713' : 'Open', () => open(it), true); btn('Print', () => quickPrint(it));
-                        btn('Copy link', () => copyLink(it), true); }
+                        btn('Copy link', () => copyLink(it), true);
+                        btn('QR', () => window.showQr(draftLink(it), '\u201c' + (it.title || 'Untitled') + '\u201d'), true); }
     if (kind === 'p') btn('Print now', () => runNow(it), true);
     btn('\u2715', () => remove(kind, it), true);
     if (kind !== 'd') return r;

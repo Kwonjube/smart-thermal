@@ -10,7 +10,24 @@
 (function (root) {
   const LIM = { d: 10, s: 20, p: 8 };
 
-  function createUnit(opt) {
+  // Heatshrink decoder (window 2^11, lookahead 2^4), as RasterZ.h. Returns
+// exactly `raw` bytes, or null if the data runs out first.
+function hsDecode(src, raw) {
+  const out = new Uint8Array(raw), win = new Uint8Array(2048);
+  let pos = 0, bit = 0, o = 0, head = 0;
+  const bits = (n) => { let v = 0; while (n--) { if (pos >= src.length) return -1;
+    v = (v << 1) | ((src[pos] >> (7 - bit)) & 1); if (++bit === 8) { bit = 0; pos++; } } return v; };
+  const emit = (c) => { out[o++] = c; win[head & 2047] = c; head++; };
+  while (o < raw) {
+    const t = bits(1); if (t < 0) return null;
+    if (t) { const c = bits(8); if (c < 0) return null; emit(c); }
+    else { const d = bits(11), k = d < 0 ? -1 : bits(4); if (k < 0) return null;
+      for (let j = 0; j <= k && o < raw; j++) emit(win[(head - d - 1) & 2047]); }
+  }
+  return out;
+}
+
+function createUnit(opt) {
     opt = opt || {};
     const fresh = () => ({ items: { d: [], s: [], p: [] }, pic: '', picData: null, nextId: 1, jobs: [], log: [], bins: {}, ver: 1,
       remote: !!opt.remote });
@@ -23,7 +40,7 @@
     };
 
     function handle(r) {
-      const p = r.path, q = r.query || {}, h = r.headers || {};
+      let p = r.path; const q = r.query || {}, h = r.headers || {};
       const remote = st.remote || !!h['x-via-relay'];
       st.log.push(r.method + ' ' + p);
       if (st.log.length > 200) st.log.shift();
@@ -41,7 +58,7 @@
       if (p === '/api/printer/status') return ok(200, { connected: true, ip: remote ? undefined : '192.168.1.50', port: remote ? undefined : 9100, alert: { code: '', message: '' }, restingMs: 0,
         paper: { name: '80 mm', printableDots: 576, charsPerLine: 48 }, queue: { pending: 0, completed: st.jobs.length, failed: 0, faults: 0 },
         system: { version: opt.version || '0.0.0', hostname: opt.hostname || 'print', ip: remote ? undefined : '192.168.1.40', freeHeap: 160000, largestBlock: 110000,
-          maxImageBytes: 98000, clockSet: true, localTime: clock(), historyStored: st.jobs.length },
+          maxImageBytes: 98000, rasterz: !!opt.rasterz, photoRoom: remote ? 50000 : 120000, storePrint: !!(st.store && st.store.printFromStorage), clockSet: true, localTime: clock(), historyStored: st.jobs.length },
         local: !remote,
         online: opt.demo ? { state: 'on', text: 'On' }
           : { state: 'on', text: 'On', url: remote || !opt.home ? undefined : opt.home.url },
@@ -54,6 +71,14 @@
         remote ? { source: /^online/.test(j.src) ? 'online' : 'home' } : { source: j.src, ip: '192.168.1.20' })), stored: st.jobs.length, capacity: 100, pending: 0 });
 
       if (p === '/api/print/raster' && st.oom > 0) { st.oom--; return ok(400, { error: 'out of memory (41000 free)' }); }
+      // EXPERIMENT (RASTERZ): compressed online photo; decoded like the unit does.
+      if (p === '/api/print/rasterz') {
+        if (!opt.rasterz) return ok(404, { error: 'not found' });
+        const raw = (+q.width / 8) * +q.rows, d = hsDecode(r.file || new Uint8Array(0), raw);
+        if (!d) return ok(400, { error: 'compressed image is cut short' });
+        r = Object.assign({}, r, { file: d });
+        p = '/api/print/raster';
+      }
       if (p === '/api/print/text' || p === '/api/print/raster') {
         const id = st.jobs.length + 1, text = p.endsWith('text');
         const job = { id, src: remote ? 'online (browser)' : 'web (browser)', type: text ? 'text' : 'raster', q, at: clock(),
@@ -79,6 +104,15 @@
           printerIp: '192.168.1.50', printerPort: 9100, hostname: opt.hostname || 'print', image: { gamma: 60, threshold: 128, brightness: 0, contrast: 0 } });
       }
       if (p === '/api/theme' || p === '/api/kiosk') return ok(200, {});
+      // Storage and reset (v0.26): home network only.
+      if (p.startsWith('/api/system/')) {
+        if (remote) return ok(403, { error: 'local only' });
+        st.store = st.store || { printFromStorage: false, total: 2228224, used: 190000 };
+        if (p === '/api/system/storage' && r.method === 'POST') Object.assign(st.store, JSON.parse(r.text || '{}'));
+        if (p === '/api/system/storage/clear') { st.store.used = 20000; return ok(200, { cleared: true }); }
+        if (p === '/api/system/reset') return ok(200, { reset: true });
+        return ok(200, Object.assign({}, st.store, { free: st.store.total - st.store.used }));
+      }
       if (p === '/api/clock') { if (r.method === 'POST') { if (remote) return ok(403, { error: 'local only' }); st.tz = JSON.parse(r.text).tz; } return ok(200, { ok: true, now: now(), tz: st.tz || 'AWST-8', local: clock() }); }
 
       if (p === '/api/items' && r.method === 'GET') return ok(200, [...st.items[q.kind]].reverse());

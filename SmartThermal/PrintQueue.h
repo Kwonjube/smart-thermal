@@ -15,6 +15,7 @@
 // thermal section below.
 
 #pragma once
+#include <LittleFS.h>
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
@@ -70,6 +71,26 @@ public:
                              const uint8_t* pre = nullptr,
                              uint8_t preLen = 0,
                              bool tail = true);
+
+  // Takes ownership of an image held in pieces (see RasterPieces.h). Printed
+  // as the same commands as one block. Returns 0 on rejection, in which case
+  // the pieces are freed here.
+  uint32_t submitRasterPieces(const RasterPieces& pieces,
+                              uint16_t widthDots, uint16_t rows,
+                              const JobSource& source,
+                              bool cut, uint8_t coverage, bool tail,
+                              bool packedZ = false);   // experiment, RasterZ.h
+
+  // An image already written to storage (print from storage, v0.26). The
+  // pixels are streamed from the file while printing. One at a time:
+  // photoBusy() is true from submission until the job has finished, and the
+  // file is deleted then. Returns 0 on rejection (file deleted here).
+  static constexpr const char* PHOTO_FILE = "/photo.bin";
+  uint32_t submitRasterFile(const char* path, size_t len,
+                            uint16_t widthDots, uint16_t rows,
+                            const JobSource& source,
+                            bool cut, uint8_t coverage, bool tail);
+  bool photoBusy() const { return _photoBusy; }
 
   uint32_t submitRaw(const uint8_t* data, size_t len,
                      const JobSource& source);
@@ -394,10 +415,14 @@ private:
   static const uint32_t WAIT_PROBE_MS   = 5000;
 
   volatile uint8_t _held        = 0;       // 4 paper out, 5 cover open
+  volatile bool    _photoBusy   = false;   // a stored image is queued or printing
   volatile bool    _waitingJob  = false;   // a job is waiting on the printer
   volatile uint32_t _downSinceMs = 0;      // first failed probe of this outage
   bool      renderText(PrintJob* job, StoredJob& rec);
   bool      renderRaster(PrintJob* job, StoredJob& rec);
+  bool      streamBandFromFile(File& f, uint8_t* buf, size_t cap,
+                               uint16_t rowBytes, uint16_t rows, StoredJob& rec);
+  static uint8_t countCoverageFile(const char* path);
   bool      renderRaw(PrintJob* job, StoredJob& rec);
 
   PrintJob* allocJob(JobType type, const uint8_t* payload, size_t len,

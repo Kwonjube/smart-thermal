@@ -113,6 +113,12 @@ details summary{cursor:pointer;font-size:11px;text-transform:uppercase;
 .futbox b{font-size:13px;line-height:1}
 .futbox b.on{color:#d33a2c}
 button.small{padding:7px 10px;font-size:13px}
+img.qr{width:132px;height:132px;image-rendering:pixelated;border:1px solid var(--line);border-radius:6px;background:#fff}
+.qrbox{display:flex;gap:16px;flex-wrap:wrap;margin-top:10px}
+.qrbox>div{text-align:center}
+.qrpop{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:50}
+.qrpop>div{background:var(--card,#fff);color:var(--ink);padding:18px;border-radius:10px;text-align:center;max-width:90vw}
+.qrpop img.qr{width:220px;height:220px}
 /* v0.24: levels. lvN = needs level N or higher; body.L1..L4 = this device's level. */
 body.L1 .lv2,body.L1 .lv3,body.L1 .lv4,body.L2 .lv3,body.L2 .lv4,body.L3 .lv4,
 body.L1 #drawer,body.L1 #dBadge,body.L2 #dBadge{display:none!important}
@@ -193,6 +199,22 @@ window.toast = function(msg, bad){
   t.classList.add('show');
   clearTimeout(toastTimer);
   toastTimer = setTimeout(()=>t.classList.remove('show'), 2600);
+};
+
+// QR codes (v0.26): drawn by the unit (/api/qr.svg) - through the website
+// too, so the path carries the website prefix when online.
+window.qrSrc = window.qrSrc || (t => (window.BASE || '') + '/api/qr.svg?t=' + encodeURIComponent(t));
+// (the preview and demo provide their own, drawn without a printer)
+window.showQr = function(url, title){
+  const p = document.createElement('div');
+  p.className = 'qrpop';
+  p.innerHTML = '<div><div class="meta" style="margin:0 0 8px"></div><img class="qr" alt="QR code">'
+    + '<div class="meta" style="overflow-wrap:anywhere;margin:8px 0"></div><button class="ghost small">Close</button></div>';
+  p.querySelector('.meta').textContent = title || 'Scan to open';
+  p.querySelector('img').src = window.qrSrc(url);
+  p.querySelectorAll('.meta')[1].textContent = url;
+  p.onclick = e => { if (e.target === p || e.target.tagName === 'BUTTON') p.remove(); };
+  document.body.appendChild(p);
 };
 
 // An error says what refused it: the printer's own reason, or (from the
@@ -335,6 +357,9 @@ async function refresh(){
     window.PRINTER.charsPerLine  = s.paper.charsPerLine;
     window.PRINTER.paper         = s.paper.name;
     window.PRINTER.maxImageBytes = s.system.maxImageBytes;
+    window.PRINTER.rasterz       = !!s.system.rasterz;   // compressed images (v0.25)
+    window.PRINTER.photoRoom     = s.system.photoRoom || 0;
+    window.PRINTER.storePrint    = !!s.system.storePrint;   // print from storage (v0.26)
     if (s.image) window.PRINTER.image = s.image;
     if($('tpv')) renderTextPreview();
     if(window.onPrinterInfo) window.onPrinterInfo();
@@ -712,6 +737,32 @@ static const char WEB_UI_TAIL[] PROGMEM = R"HTML(
     <div class="meta" style="margin-top:12px">
       <a href="/log" target="_blank">Open the log</a> &mdash; recent activity, with a Copy button.
     </div>
+    <details style="margin-top:16px" id="online">
+      <summary>Online printing</summary>
+      <div class="meta" id="oState" style="margin-top:8px"></div>
+      <label class="chk" style="margin-top:10px"><input type="checkbox" id="oOn"> Allow online printing</label>
+      <label class="chk" style="margin-top:6px"><input type="checkbox" id="oPause"> Pause (visitors can look, nothing prints)</label>
+      <div id="oForm">
+        <div class="meta" id="oName"></div>
+        <label class="chk" style="margin-top:10px"><input type="checkbox" id="oVis"> Visible to other printers</label>
+        <label class="chk" style="margin-top:6px"><input type="checkbox" id="oSec"> Extra secure: approve each device first</label>
+      </div>
+      <div class="row" style="margin-top:12px"><button id="oSave">Save online printing</button></div>
+      <div id="oLink" style="display:none;margin-top:10px">
+        <div class="meta">Link: <a id="oUrl" target="_blank" rel="noopener"></a></div>
+        <div class="meta">Owner code: <b id="oCode"></b></div>
+        <div class="meta" style="overflow-wrap:anywhere"><span id="oSecHelp">Devices ask first and a &ldquo;Knock knock!&rdquo; slip prints. </span>Owner page (approve devices, turn online printing off): <a id="oAdmin" target="_blank" rel="noopener"></a> with the owner code.</div>
+        <div class="qrbox">
+          <div><img class="qr" id="oQr" alt="QR code for the link"><div class="meta">Anyone with the link</div></div>
+          <div><img class="qr" id="oQrA" alt="QR code for the owner page"><div class="meta">Owner page</div></div>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <button class="ghost small" id="oNewLink">New link</button>
+          <button class="ghost small" id="oNewOwner">New owner code</button>
+        </div>
+        <div class="meta">The old one stops working, and a new slip prints.</div>
+      </div>
+    </details>
     <details style="margin-top:16px" id="kiosk">
       <summary>Kiosk (party screen)</summary>
       <label for="kTitle">Screen title</label><input id="kTitle" maxlength="120">
@@ -732,29 +783,19 @@ static const char WEB_UI_TAIL[] PROGMEM = R"HTML(
         only. Its &#128274; button returns here. The camera needs a one-off browser setting on the
         kiosk computer.</div>
     </details>
-    <details style="margin-top:16px" id="online">
-      <summary>Online printing</summary>
-      <div class="meta" id="oState" style="margin-top:8px"></div>
-      <label class="chk" style="margin-top:10px"><input type="checkbox" id="oOn"> Allow online printing</label>
-      <label class="chk" style="margin-top:6px"><input type="checkbox" id="oPause"> Pause (visitors can look, nothing prints)</label>
-      <div id="oForm">
-        <div class="meta" id="oName"></div>
-        <label class="chk" style="margin-top:10px"><input type="checkbox" id="oVis"> Visible to other printers</label>
-        <label class="chk" style="margin-top:6px"><input type="checkbox" id="oSec"> Extra secure: approve each device first</label>
-        <label for="oHost">Relay address</label><input id="oHost" maxlength="63" autocapitalize="none" placeholder="print.justifiedsystems.com.au">
-        <div class="meta">Leave as it is unless told otherwise.</div>
+    <details style="margin-top:16px" id="storage">
+      <summary>Storage and reset</summary>
+      <div class="meta" id="stInfo" style="margin-top:8px"></div>
+      <label class="chk" style="margin-top:10px"><input type="checkbox" id="stPrint"> Print images from storage (testing)</label>
+      <div class="meta">Images go to the printer's storage first and print from there as one job, up to about
+        900 mm at home and 260 mm online. Sending takes a little longer. Off by default; needs free storage.</div>
+      <div class="row" style="margin-top:12px">
+        <button class="ghost" id="stClear" style="flex:0 0 auto">Clear storage</button>
+        <button class="ghost" id="stReset" style="flex:0 0 auto;color:var(--bad);border-color:var(--bad)">Factory reset</button>
       </div>
-      <div class="row" style="margin-top:12px"><button id="oSave">Save online printing</button></div>
-      <div id="oLink" style="display:none;margin-top:10px">
-        <div class="meta">Link: <a id="oUrl" target="_blank" rel="noopener"></a></div>
-        <div class="meta">Owner code: <b id="oCode"></b></div>
-        <div class="meta" id="oSecHelp" style="overflow-wrap:anywhere">Devices ask first and a &ldquo;Knock knock!&rdquo; slip prints. Approve them at <a id="oAdmin" target="_blank" rel="noopener"></a> with the owner code.</div>
-        <div class="row" style="margin-top:8px">
-          <button class="ghost small" id="oNewLink">New link</button>
-          <button class="ghost small" id="oNewOwner">New owner code</button>
-        </div>
-        <div class="meta">The old one stops working, and a new slip prints.</div>
-      </div>
+      <div class="meta" style="margin-top:8px">Clear storage removes drafts, saved and scheduled prints, the stored
+        picture, print history and the saved log. Settings stay. Factory reset erases everything, including Wi-Fi
+        and the online link, and starts setup again; online, it joins as a new device that needs approving.</div>
     </details>
   </details>
 </div>
@@ -870,7 +911,7 @@ static const char WEB_UI_TAIL[] PROGMEM = R"HTML(
     el('oOn').checked = o.enabled;
     el('oPause').checked = !!o.paused; el('oPause').disabled = !o.enabled;
     el('oName').textContent = 'Shown online as \u201c' + o.name + '\u201d (the Hostname above).';
-    el('oVis').checked = o.visible; el('oSec').checked = o.secure; el('oHost').value = o.host;
+    el('oVis').checked = o.visible; el('oSec').checked = o.secure;
     el('oSecHelp').style.display = o.secure ? '' : 'none';
     el('oForm').style.opacity = o.enabled ? 1 : 0.5;
     el('oLink').style.display = o.url ? '' : 'none';
@@ -878,6 +919,7 @@ static const char WEB_UI_TAIL[] PROGMEM = R"HTML(
       el('oUrl').textContent = o.url; el('oUrl').href = o.url;
       const a = o.url.replace(/\/$/, '') + '-a';
       el('oAdmin').textContent = a; el('oAdmin').href = a;
+      el('oQr').src = window.qrSrc(o.url); el('oQrA').src = window.qrSrc(a);
     }
     el('oCode').textContent = o.ownerCode || '';
   };
@@ -896,7 +938,7 @@ static const char WEB_UI_TAIL[] PROGMEM = R"HTML(
     el('oSave').onclick = async () => {
       try {
         paint(await post('/api/online', { enabled: el('oOn').checked, visible: el('oVis').checked,
-          secure: el('oSec').checked, host: el('oHost').value.trim() || 'print.justifiedsystems.com.au' }));
+          secure: el('oSec').checked }));
         window.toast('saved');
         setTimeout(load, 3000);
       } catch (e) { window.toast(e.message, true); }
@@ -909,6 +951,40 @@ static const char WEB_UI_TAIL[] PROGMEM = R"HTML(
     el('oNewOwner').onclick = async () => {
       if (!confirm('Make a new owner code? The old one stops working.')) return;
       try { paint(await post('/api/online/newowner')); window.toast('new owner code - a slip will print'); setTimeout(load, 4000); }
+      catch (e) { window.toast(e.message, true); }
+    };
+  });
+})();
+
+// Storage and reset (v0.26), Settings section: home network only.
+(() => {
+  const el = id => document.getElementById(id);
+  const kb = n => Math.round(n / 1024) + ' KB';
+  const post = (p, b) => window.api(p, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b || {}) });
+  const paint = s => {
+    el('stPrint').checked = !!s.printFromStorage;
+    if (window.PRINTER) window.PRINTER.storePrint = !!s.printFromStorage;   // takes effect now
+    el('stInfo').textContent = 'Storage: ' + kb(s.used) + ' used of ' + kb(s.total) + ', ' + kb(s.free) + ' free.'
+      + (s.free < 64 * 1024 ? ' Nearly full: Clear storage frees it.' : '');
+  };
+  const load = async () => { try { paint(await window.api('/api/system/storage')); } catch (e) {} };
+  document.addEventListener('DOMContentLoaded', () => {
+    if (window.REMOTE || !el('stPrint')) return;
+    el('storage').addEventListener('toggle', () => { if (el('storage').open) load(); });
+    el('stPrint').onchange = async () => {
+      try { paint(await post('/api/system/storage', { printFromStorage: el('stPrint').checked }));
+            window.toast(el('stPrint').checked ? 'printing from storage' : 'printing from memory'); }
+      catch (e) { window.toast(e.message, true); }
+    };
+    el('stClear').onclick = async () => {
+      if (!confirm('Clear storage?\n\nDrafts, saved and scheduled prints, the stored picture, print history and the saved log are deleted. Settings stay.\n\nThe printer restarts.')) return;
+      try { await post('/api/system/storage/clear'); window.toast('clearing storage - the printer restarts'); }
+      catch (e) { window.toast(e.message, true); }
+    };
+    el('stReset').onclick = async () => {
+      if (!confirm('Factory reset?\n\nEverything is erased: Wi-Fi, settings, online printing, drafts, saved and scheduled prints, history and logs.')) return;
+      if (!confirm('Are you sure? This cannot be undone.\n\nThe printer restarts into setup and prints a setup slip. Online, it joins as a new device.')) return;
+      try { await post('/api/system/reset'); window.toast('resetting - the printer restarts into setup'); }
       catch (e) { window.toast(e.message, true); }
     };
   });

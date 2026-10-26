@@ -11,6 +11,9 @@
 // interleaving ESC/POS streams, and what keeps HTTP handlers from blocking
 // for the seconds a real print takes.
 
+#include "Mem.h"
+#include <LittleFS.h>
+#include <Preferences.h>
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <time.h>
@@ -189,7 +192,7 @@ void testTextJob() {
   r += "Paper    : " + String(printer.paper().name) + "\n";
   r += "Dots     : " + String(printer.printableDots()) + "\n";
   r += "Chars    : " + String(printer.charsPerLine()) + "\n";
-  r += "Heap     : " + String(ESP.getFreeHeap() / 1024) + " kB\n";
+  r += "Heap     : " + String(Mem::free8() / 1024) + " kB\n";
   r += "Uptime   : " + String(millis() / 1000) + " s\n";
   r += "----------------------------\n";
 
@@ -383,7 +386,7 @@ bool testGreyField(uint16_t rows, uint8_t coverage, uint16_t chunkRows,
   uint8_t* buf = (uint8_t*)malloc(bytes);
   if (!buf) {
     Log.printf("[grey] need %u bytes, largest block is %u\n",
-                  (unsigned)bytes, ESP.getMaxAllocHeap());
+                  (unsigned)bytes, Mem::block8());
     return false;
   }
   memset(buf, 0, bytes);
@@ -441,6 +444,10 @@ bool testGreyField(uint16_t rows, uint8_t coverage, uint16_t chunkRows,
 void setup() {
   Serial.begin(115200);
   Log.begin();
+  // Before Wi-Fi takes memory: find the spare 32-bit-only IRAM that holds
+  // images (Mem.h, v0.25).
+  Mem::probeIram();
+  Log.printf("[mem] %u KB of IRAM for images\n", (unsigned)(Mem::g_iramPure / 1024));
   delay(400);
   Log.println("\n\nSmart Thermal");
 
@@ -479,6 +486,20 @@ void setup() {
     Log.println("[train] saved progress found - 'T' resumes it, 'Z' discards it");
 #endif
 
+  // Clear storage / factory reset (v0.26): format before anything opens a
+  // file. The flag is set by /api/system/storage/clear and /api/system/reset.
+  {
+    Preferences p;
+    bool fmt = false;
+    if (p.begin("unit", true)) { fmt = p.getBool("fmt", false); p.end(); }
+    if (fmt) {
+      Log.println("[storage] formatting (clear storage / factory reset)");
+      LittleFS.begin(true);
+      LittleFS.format();
+      LittleFS.end();
+      if (p.begin("unit", false)) { p.remove("fmt"); p.end(); }
+    }
+  }
   if (!jobStore.begin())
     Log.println("[history] LittleFS mount failed - history will not persist");
   else {
@@ -618,7 +639,7 @@ void startLadder() {
   s_ladderJob = 0;
   Log.printf("[ladder] start: 96 to 128 KB in 4 KB steps, 50%% grey. "
              "Largest free block now %u KB.\n",
-             (unsigned)(ESP.getMaxAllocHeap() / 1024));
+             (unsigned)(Mem::block8() / 1024));
 }
 
 void serviceLadder() {
@@ -645,7 +666,7 @@ void serviceLadder() {
   const size_t   rowBytes = W / 8;
   const uint16_t rows     = (s_ladderKB * 1024UL) / rowBytes;
   const size_t   len      = rowBytes * rows;
-  const size_t   largest  = ESP.getMaxAllocHeap();
+  const size_t   largest  = Mem::block8();
 
   uint8_t* buf = static_cast<uint8_t*>(malloc(len));
   if (!buf) {
@@ -919,7 +940,7 @@ void loop() {
                   Log.printf("[debug] %s\n", st.debugMode ? "on" : "off"); }
                 break;
       case 'h': Log.printf("[heap] free %u, largest %u\n",
-                              ESP.getFreeHeap(), ESP.getMaxAllocHeap()); break;
+                              Mem::free8(), Mem::block8()); break;
       case 's': printSettingsSummary(); break;
       case 'g': testGreyField(1000, 2, 0);    break;   // saved chunk
       case 'G': testGreyField(1000, 4, 0);    break;

@@ -50,10 +50,12 @@ void SlipDesk::wantOnline(const char* name, const char* url, const char* ownerCo
   _state[ONLINE] = WANTED;
 }
 
-void SlipDesk::wantKnock(const char* who, const char* printer, const char* url) {
+void SlipDesk::wantKnock(const char* who, const char* printer, const char* url,
+                         const char* dev, const char* loc) {
   if (_state[KNOCK] == SUBMITTED) return;
   strlcpy(_kWho, who, sizeof(_kWho)); strlcpy(_kName, printer, sizeof(_kName));
   strlcpy(_kUrl, url, sizeof(_kUrl));
+  strlcpy(_kDev, dev ? dev : "", sizeof(_kDev)); strlcpy(_kLoc, loc ? loc : "", sizeof(_kLoc));
   _state[KNOCK] = WANTED;
 }
 
@@ -321,17 +323,26 @@ bool SlipDesk::printOnline(uint32_t& first, uint32_t& last) {
   return last != 0;
 }
 
-// Someone asked to print here (extra secure is on).
+// Someone asked to print here (extra secure is on). v0.26: with their
+// device and rough location, and a QR code to the approval page.
 bool SlipDesk::printKnock(uint32_t& first, uint32_t& last) {
-  first = _q->submitText("KNOCK KNOCK!\n", SLIP, CENTRE, 2, true, false);
-  if (!first) return false;
-  String t;
-  t += "\n"; t += _kWho; t += "\nwould like to print to\n"; t += _kName; t += ".\n\n";
-  t += "Approve or decline at:\n";
   String admin = _kUrl;
   if (admin.endsWith("/")) admin.remove(admin.length() - 1);
   admin += "-a";
-  t += admin; t += "\n";
-  last = _q->submitText(t, SLIP, CENTRE, 1, false, true);
+  Qr code;
+  if (!_noQr && !makeQr(_width, admin.c_str(), code)) return false;
+
+  first = _q->submitText("KNOCK KNOCK!\n", SLIP, CENTRE, 2, true, false);
+  if (!first) return false;
+  String t;
+  t += "\n"; t += _kWho; t += "\nwould like to print to\n"; t += _kName; t += ".\n";
+  if (_kDev[0]) { t += "\nDevice: "; t += _kDev; }
+  if (_kLoc[0]) { t += "\nNear: ";   t += _kLoc; }
+  if (_kDev[0] || _kLoc[0]) t += "\n";
+  t += code.buf ? "\nScan to approve or decline:\n" : "\nApprove or decline at:\n";
+  if (!_q->submitText(t, SLIP, CENTRE, 1, false, false)) return false;
+  if (!submitQr(*_q, code)) return false;
+  String u = "\n"; u += admin; u += "\nwith the owner code.\n";
+  last = _q->submitText(u, SLIP, CENTRE, 1, false, true);
   return last != 0;
 }

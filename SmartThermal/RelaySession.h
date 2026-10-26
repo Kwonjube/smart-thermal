@@ -17,7 +17,9 @@
 //                  as binary frames totalling len
 //   unit  -> relay {"t":"res","id","s","ct","cc"} + binary frames +
 //                  {"t":"end","id"}
-//   relay -> unit  {"t":"notice","k":"device-request","name":"..."}
+//   relay -> unit  {"t":"notice","k":"device-request","name":"...",
+//                   "dev":"iPhone, Safari","loc":"Perth, WA, AU"}   (dev, loc v0.26)
+//   relay -> unit  {"t":"owner","a":"off"}   owner pressed Turn off (v0.26)
 //   unit  -> relay {"t":"newcode"}        owner asked for a new link
 //   unit  -> relay "ping" every 45 s; relay answers "pong"
 
@@ -45,6 +47,11 @@ public:
   virtual bool  hello(const char* nonce, String& json) = 0;
   virtual void  onState(const char* s, const char* code, const char* url, const char* msg) = 0;
   virtual void  onNotice(const char* kind, const char* name) = 0;
+  // v0.26: with the device and rough location; defaults to the old call.
+  virtual void  onNotice2(const char* kind, const char* name, const char* dev, const char* loc) {
+    (void)dev; (void)loc; onNotice(kind, name);
+  }
+  virtual void  onOwnerOff() {}            // owner pressed Turn off (v0.26)
   virtual bool  stopWanted() = 0;          // switched off or settings changed
   virtual bool  takeNewCode() = 0;         // "New link" pressed
   virtual Conn* loopback() = 0;            // a fresh connection object (deleted by caller)

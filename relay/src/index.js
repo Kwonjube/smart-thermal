@@ -78,6 +78,21 @@ const redirect = (status, location, extra = {}) => {
 };
 
 // ---------------------------------------------------------------- small helpers
+// Short device description for the knock-knock slip and the owner page (0.26), e.g.
+// "iPhone, Safari". Only the kind of device and browser; nothing that identifies a person.
+function deviceKind(ua) {
+  ua = String(ua || '');
+  const os = /iPad/.test(ua) ? 'iPad' : /iPhone/.test(ua) ? 'iPhone'
+    : /Android/.test(ua) ? (/Mobile/.test(ua) ? 'Android phone' : 'Android tablet')
+    : /CrOS/.test(ua) ? 'Chromebook' : /Windows/.test(ua) ? 'Windows PC'
+    : /Macintosh|Mac OS X/.test(ua) ? 'Mac' : /Linux/.test(ua) ? 'Linux PC' : '';
+  const br = /Edg[A]?\//.test(ua) ? 'Edge' : /OPR\/|Opera/.test(ua) ? 'Opera' : /SamsungBrowser/.test(ua) ? 'Samsung Internet'
+    : /FxiOS|Firefox\//.test(ua) ? 'Firefox' : /CriOS|Chrome\//.test(ua) ? 'Chrome' : /Safari\//.test(ua) ? 'Safari' : '';
+  return [os, br].filter(Boolean).join(', ').slice(0, 47) || 'Unknown device';
+}
+// The owner page may show the printer's own QR code (/p/<code>/api/qr.svg), so its
+// images may come from this origin. Still no scripts.
+const OWNER_CSP = OWN_CSP.replace("img-src data:", "img-src 'self' data:");
 const enc = (s) => new TextEncoder().encode(s);
 function b64url(bytes) {
   let s = '';
@@ -280,6 +295,7 @@ export class Relay extends DurableObject {
     `);
     try { this.sql.exec('ALTER TABLE devices ADD COLUMN csrf_hash TEXT'); } catch {} // one-time owner form token
     try { this.sql.exec('ALTER TABLE printers ADD COLUMN paused INTEGER DEFAULT 0'); } catch {} // firmware 0.23: owner paused online printing
+    try { this.sql.exec('ALTER TABLE devices ADD COLUMN kind TEXT'); } catch {}             // 0.26: device type, e.g. "iPhone, Safari"
     try { this.sql.exec('ALTER TABLE events ADD COLUMN n INTEGER DEFAULT 1'); } catch {}    // 0.24: repeats counted
     try { this.sql.exec('ALTER TABLE events ADD COLUMN last INTEGER'); } catch {}            // 0.24: time of the latest repeat
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', 'pong'));
@@ -798,7 +814,11 @@ ${note ? `<p class="note">${esc(note)}</p>` : ''}
   <label for="name">Your name</label>
   <input id="name" name="name" maxlength="40" required autocomplete="name">
   <button type="submit">Ask to print</button>
-</form>`;
+</form>
+<p class="muted small"><strong>Information collected:</strong> the name you enter, the type of device
+(for example \u201ciPhone, Safari\u201d) and an approximate location from your internet connection
+(city, region, country). They are printed on a slip for the printer's owner and shown on their
+owner page, so they can decide. They are kept until the owner removes this device.</p>`;
     }
     return html(shell(p.name, body));
   }
@@ -822,9 +842,12 @@ ${note ? `<p class="note">${esc(note)}</p>` : ''}
 
     const token = randomToken();
     const cf = this.cfInfo(request);
-    this.sql.exec("INSERT INTO devices(printer_id, token_hash, name, role, created, place) VALUES (?, ?, ?, 'pending', ?, ?)",
-      p.id, await sha256hex(token), name, now, [cf.city, cf.region, cf.country].filter(Boolean).join(', ').slice(0, 120));
-    this.enqueueMsg(p.id, JSON.stringify({ t: 'notice', k: 'device-request', name })); // "Knock knock!" slip
+    const place = [cf.city, cf.region, cf.country].filter(Boolean).join(', ').slice(0, 120);
+    const kind = deviceKind(request.headers.get('user-agent'));
+    this.sql.exec("INSERT INTO devices(printer_id, token_hash, name, role, created, place, kind) VALUES (?, ?, ?, 'pending', ?, ?, ?)",
+      p.id, await sha256hex(token), name, now, place, kind);
+    // "Knock knock!" slip. dev/loc (0.26) are ignored by older firmware.
+    this.enqueueMsg(p.id, JSON.stringify({ t: 'notice', k: 'device-request', name, dev: kind, loc: place.slice(0, 63) }));
     this.log(p.id, 'info', 'A device asked to print (extra secure)');
     return redirect(303, `/p/${code}/`, { 'set-cookie': deviceCookie(p.id, token) });
   }
@@ -870,6 +893,16 @@ ${note ? `<p class="note">${esc(note)}</p>` : ''}
       }
       const id = String(f.get('id') || '');
       const target = /^[0-9a-f]{16}$/.test(id) ? this.one('SELECT * FROM devices WHERE printer_id = ? AND substr(token_hash, 1, 16) = ?', p.id, id) : null;
+      if (action === 'off') {
+        // Turn off (0.26): the printer saves online printing off and disconnects; it stays
+        // off until switched back on in its Settings at home. Paused here as well, so
+        // visitors are told at once; the next hello sets the real state again.
+        if (!this.socketFor(p.id)) return redirect(303, `${self}?e=offline`);
+        this.enqueueMsg(p.id, JSON.stringify({ t: 'owner', a: 'off' }));
+        this.sql.exec('UPDATE printers SET paused = 1 WHERE id = ?', p.id);
+        this.log(p.id, 'info', 'Online printing turned off from the owner page');
+        return redirect(303, `${self}?m=off`);
+      }
       if (action === 'signout') {
         this.sql.exec('DELETE FROM devices WHERE printer_id = ? AND token_hash = ?', p.id, dev.token_hash);
         return redirect(303, self, { 'set-cookie': deviceCookie(p.id, '', 0) });
@@ -898,20 +931,39 @@ ${note ? `<p class="note">${esc(note)}</p>` : ''}
 </form>`));
     }
 
-    const devs = this.all('SELECT * FROM devices WHERE printer_id = ? ORDER BY created DESC', p.id);
     const csrf = await this.issueCsrf('devices', 'printer_id = ? AND token_hash = ?', p.id, dev.token_hash);
+    const online = !!this.socketFor(p.id);
+    if (url.searchParams.get('confirm') === 'off') {
+      return html(shell(p.name, `<h1>Turn off online printing?</h1>
+<p>Nobody will be able to print to <strong>${esc(p.name)}</strong> over the internet, including you,
+until it is switched back on in the printer's Settings on the home network.</p>
+<form method="post" action="${self}" class="inline"><input type="hidden" name="csrf" value="${csrf}"><input type="hidden" name="action" value="off"><button>Turn off</button></form>
+<form method="get" action="${self}" class="inline"><button class="ghost">Cancel</button></form>`));
+    }
+    const msg = url.searchParams.get('m'), err = url.searchParams.get('e');
+    const note = msg === 'off' ? "Online printing is turned off. Switch it back on in the printer's Settings at home."
+      : err === 'offline' ? 'The printer is offline right now, so it could not be turned off. Try again once it is online.' : '';
+    const devs = this.all('SELECT * FROM devices WHERE printer_id = ? ORDER BY created DESC', p.id);
+    const link = this.link(code);
     const btn = (id, action, label, ghost) => `<form method="post" action="${self}" class="inline"><input type="hidden" name="csrf" value="${csrf}"><input type="hidden" name="action" value="${action}"><input type="hidden" name="id" value="${esc(id)}"><button${ghost ? ' class="ghost"' : ''}>${label}</button></form>`;
-    const row = (d, actions) => `<li><div><strong>${esc(d.name)}</strong>${d.token_hash === dev.token_hash ? ' (this device)' : ''}<br><span class="muted">${esc(perth(d.created))}${d.place ? ' · ' + esc(d.place) : ''}</span></div><div class="acts">${actions}</div></li>`;
+    const row = (d, actions) => `<li><div><strong>${esc(d.name)}</strong>${d.token_hash === dev.token_hash ? ' (this device)' : ''}<br><span class="muted">${esc(perth(d.created))}${d.kind ? ' · ' + esc(d.kind) : ''}${d.place ? ' · ' + esc(d.place) : ''}</span></div><div class="acts">${actions}</div></li>`;
     const pending = devs.filter((d) => d.role === 'pending');
     const approvedDevs = devs.filter((d) => d.role === 'guest' || (d.role === 'owner' && d.owner_hash === p.owner_hash));
     const body = `<h1>${esc(p.name)}</h1>
+${note ? `<p class="note">${esc(note)}</p>` : ''}
 <p class="muted">${p.secure ? 'Extra secure: only approved devices can print.' : 'Anyone with the link can print. Approvals apply to extra secure printers only.'}</p>
+<h2>Printer link</h2>
+${online && !p.paused ? `<p><img class="qr" src="/p/${code}/api/qr.svg?t=${encodeURIComponent(link)}" width="168" height="168" alt="QR code for the printer link"></p>` : ''}
+<p><code>${esc(link)}</code><br><span class="muted">${p.secure ? 'Devices that scan it ask first; approve them below.' : 'Anyone with the link can print.'}</span></p>
 <h2>Requests</h2>
 ${pending.length ? `<ul class="list">${pending.map((d) => row(d, btn(d.token_hash.slice(0, 16), 'approve', 'Approve') + btn(d.token_hash.slice(0, 16), 'decline', 'Decline', true))).join('')}</ul>` : '<p class="muted">No requests waiting.</p>'}
 <h2>Approved devices</h2>
 ${approvedDevs.length ? `<ul class="list">${approvedDevs.map((d) => row(d, (d.role === 'owner' ? '<span class="pill">Owner</span>' : '') + btn(d.token_hash.slice(0, 16), 'revoke', 'Revoke', true))).join('')}</ul>` : '<p class="muted">None yet.</p>'}
+<h2>Online printing</h2>
+${p.paused ? '<p class="muted">Paused or turned off at the printer.</p>' : `<p class="muted">Turning it off stops all online printing until it is switched back on in the printer's Settings at home.</p>
+<form method="get" action="${self}"><input type="hidden" name="confirm" value="off"><button>Turn off online printing</button></form>`}
 <form method="post" action="${self}"><input type="hidden" name="csrf" value="${csrf}"><input type="hidden" name="action" value="signout"><button class="ghost">Sign out this device</button></form>`;
-    return html(shell(p.name, body));
+    return html(shell(p.name, body), 200, { 'content-security-policy': OWNER_CSP });
   }
 
   // Admin page section: newest 150 events, optionally for one printer or errors only.
@@ -1119,7 +1171,7 @@ main{max-width:${wide ? '60rem' : '30rem'};margin:0 auto;padding:2.5rem 1rem 4re
 .bar{display:flex;gap:.3rem;height:.4rem;width:9rem;margin-bottom:1.5rem}.bar span{border-radius:9px}
 .bar span:nth-child(1){flex:5;background:#E98D78}.bar span:nth-child(2){flex:2.5;background:#946F92}.bar span:nth-child(3){flex:2.5;background:#9598C6}
 h1{font-size:1.8rem;line-height:1.2;margin:0 0 .75rem}h2{font-size:1.2rem;margin:2rem 0 .75rem}h3{font-size:1.1rem;margin:0 0 .75rem}
-.muted{color:var(--muted)}.note{background:var(--card);border-left:4px solid var(--coral);padding:.75rem 1rem;border-radius:.5rem}
+.muted{color:var(--muted)}.small{font-size:.85rem}img.qr{background:#fff;padding:8px;border-radius:.75rem}.note{background:var(--card);border-left:4px solid var(--coral);padding:.75rem 1rem;border-radius:.5rem}
 label{display:block;font-weight:600;margin:1.25rem 0 .4rem}
 input{width:100%;min-height:3rem;padding:0 1rem;border-radius:999px;border:2px solid var(--line);background:var(--card);color:var(--text);font:inherit}
 button{min-height:2.75rem;padding:0 1.25rem;border-radius:999px;border:2px solid transparent;background:var(--coral);color:#1E1D35;font:600 1rem/1 system-ui,sans-serif;cursor:pointer;margin-top:1rem}

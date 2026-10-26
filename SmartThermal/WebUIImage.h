@@ -28,6 +28,9 @@ static const char WEB_UI_IMAGE[] PROGMEM = R"HTML(
   <div class="drop" id="drop">Drop photos, paste, or tap to choose
     <input type="file" id="ifile" accept="image/*" multiple style="display:none">
   </div>
+  <!-- v0.26: straight to the camera on phones (iPhone and Android) -->
+  <input type="file" id="icam" accept="image/*" capture="environment" style="display:none">
+  <button class="ghost" id="icamb" style="display:none;width:100%;margin-top:8px">Take photo</button>
   <div class="row" id="inav" style="display:none;margin-top:8px;align-items:center">
     <button class="ghost" id="iprev" style="flex:0 0 auto;padding:6px 12px">&lsaquo;</button>
     <span class="meta" id="iname" style="flex:1 1 auto;text-align:center;margin:0"></span>
@@ -93,12 +96,6 @@ static const char WEB_UI_IMAGE[] PROGMEM = R"HTML(
 
 <script>
 (() => {
-  // Hard ceiling in WebApi.h. The live value from /api/printer/status is
-  // lower and more honest, because an image needs one contiguous
-  // allocation and the heap fragments as features are added.
-  const HARD_MAX = 128 * 1024;
-  let maxBytes = HARD_MAX;
-
   // Pictures are kept at most KEEP_W pixels wide and KEEP_MP megapixels.
   // Width, not the long side: a tall receipt shrunk by its height lost all
   // its small print (3950 px tall became 175 px wide). 1200 is twice the
@@ -289,6 +286,21 @@ static const char WEB_UI_IMAGE[] PROGMEM = R"HTML(
                   pv.data[o] = pv.data[o+1] = pv.data[o+2] = c; pv.data[o+3] = 255; }
         }
       }
+    } else if(bayerOn()){
+    // Online photos (v0.25): ordered 8x8 Bayer dither. Its regular
+    // pattern compresses to ~40 % (Atkinson's to ~93 %), so a photo fits
+    // the unit's memory while the online link is up. Thresholds span 24-232
+    // so highlights stay white and shadows black. Threshold shifts it.
+    const shift = th - 128;
+    for(let y = 0; y < rows; y++){
+      for(let x = 0; x < W; x++){
+        const i = y * W + x, black = g[i] < (BAYER[((y & 7) << 3) | (x & 7)] + 0.5) * 3.25 + 24 + shift;
+        const on = inv ? !black : black;
+        if(on) out[y * rowBytes + (x >> 3)] |= 0x80 >> (x & 7);
+        if(pv){ const o = i * 4, c = on ? 0 : 255;
+                pv.data[o] = pv.data[o+1] = pv.data[o+2] = c; pv.data[o+3] = 255; }
+      }
+    }
     } else {
     // PHOTO - Atkinson: leaks 1/4 of the error, which clusters dots and
     // suits a printhead that cannot hold isolated ones.
@@ -340,7 +352,7 @@ static const char WEB_UI_IMAGE[] PROGMEM = R"HTML(
 
     el('imode').value = p.mode || 'photo';
     const k = pack(p.img, true, cropping ? null : p.crop, p.mode);
-    const bytes = k.data.length, nParts = splitParts(k).length;
+    const bytes = k.data.length, nParts = splitParts(k, p.mode).length;
     const rest = restMsFor(k.rows, k.coverage);
     packed = k;
 
@@ -361,14 +373,17 @@ static const char WEB_UI_IMAGE[] PROGMEM = R"HTML(
 
   function queueRender(){ clearTimeout(timer); timer = setTimeout(render, 90); }
 
-  // Upload one packed photo. A 503 means the unit has no room yet (the
-  // previous photo is still in memory): wait and try again.
-  // The unit holds one image in memory at a time (~95 KB), so a long one is
-  // sent in parts, each after the last has printed. Cuts are made at a
-  // white row near the limit when there is one, so text documents join
-  // invisibly; a photo with no white rows joins with a faint line.
-  function splitParts(k){
-    const rb = k.width / 8, limit = Math.min(maxBytes, window.REMOTE ? 24 * 1024 : 64 * 1024);
+  // One photo, one print, as in v0.18. Parts only when it is longer than
+  // the unit can hold: each part is sent after the last has printed, cut
+  // at a white row near the limit when there is one.
+  function splitParts(k, mode){
+    // Compressed (v0.25): only the compressed bytes are held, so one job may
+    // be up to 512 KB decoded (~910 mm) - no parts, no joins. A home photo
+    // (Atkinson, not compressed) must fit the unit's memory whole: about
+    // 120 KB with the online link closed, so parts of at most 96 KB.
+    const rb = k.width / 8,
+          limit = store() ? (window.REMOTE ? 150 * 1024 : 512 * 1024)   // relay body limit online
+                : zOn(mode) ? 512 * 1024 : (window.REMOTE ? 24 * 1024 : 96 * 1024);
     const maxRows = Math.max(32, Math.floor(limit / rb)), out = [];
     const white = y => { for(let i = y * rb; i < (y + 1) * rb; i++) if(k.data[i]) return false; return true; };
     let a = 0;
@@ -386,19 +401,86 @@ static const char WEB_UI_IMAGE[] PROGMEM = R"HTML(
     return out;
   }
 
-  async function upload(k, cut, tail){
-    const url = '/api/print/raster?width=' + k.width + '&rows=' + k.rows
-              + '&coverage=' + k.coverage + '&cut=' + (cut ? 1 : 0) + '&tail=' + (tail ? 1 : 0);
+  // ---- Compressed images (v0.25) ---------------------------------------
+  // Sent to /api/print/rasterz when the unit offers it (status
+  // system.rasterz): every online image, and "Text & drawings" at home
+  // (which compresses to ~13-30 %). Home photos stay Atkinson and
+  // uncompressed, exactly as before. Online photos use the Bayer dither,
+  // because Atkinson does not compress.
+  // Print from storage (Settings switch, v0.26): images go uncompressed
+  // (home photos and online photos alike stay Atkinson) to the unit's
+  // storage and print from there, so memory no longer limits them.
+  const store   = () => !!(window.PRINTER && window.PRINTER.storePrint);
+  const zAvail  = () => !!(window.PRINTER && window.PRINTER.rasterz) && !store();
+  const zOn     = mode => zAvail() && (window.REMOTE || mode === 'text');
+  const bayerOn = () => zAvail() && !!window.REMOTE;
+  const BAYER = [0,32,8,40,2,34,10,42, 48,16,56,24,50,18,58,26, 12,44,4,36,14,46,6,38,
+                 60,28,52,20,62,30,54,22, 3,35,11,43,1,33,9,41, 51,19,59,27,49,17,57,25,
+                 15,47,7,39,13,45,5,37, 63,31,55,23,61,29,53,21];
+  // Heatshrink encoder (window 2^11, lookahead 2^4), greedy with hash
+  // chains. Its output is checked against the reference Heatshrink and the
+  // unit's decoder (tests/host/rasterz_test.cpp).
+  // Heatshrink encoder (window 2^11, lookahead 2^4), greedy with hash chains.
+  function hsCompress(src){
+    const W = 11, L = 4, WIN = 1 << W, MAXLEN = 1 << L, MINLEN = 2;
+    const n = src.length, out = new Uint8Array(n + (n >> 3) + 16);
+    let o = 0, acc = 0, nb = 0;
+    const put = (v, k) => { for(let i = k - 1; i >= 0; i--){ acc = (acc << 1) | ((v >> i) & 1);
+      if(++nb === 8){ out[o++] = acc; acc = 0; nb = 0; } } };
+    const head = new Int32Array(65536).fill(-1), prev = new Int32Array(n);
+    const key = i => (src[i] << 8) | src[i + 1];
+    const insert = i => { if(i + 1 < n){ const h = key(i); prev[i] = head[h]; head[h] = i; } };
+    let i = 0;
+    while(i < n){
+      let best = 0, dist = 0;
+      if(i + 1 < n){
+        const lim = Math.min(MAXLEN, n - i);
+        for(let j = head[key(i)], tries = 0; j >= 0 && i - j <= WIN && tries < 96; j = prev[j], tries++){
+          let k = 0; while(k < lim && src[j + k] === src[i + k]) k++;
+          if(k > best){ best = k; dist = i - j; if(k === lim) break; }
+        }
+      }
+      if(best >= MINLEN){
+        put(0, 1); put(dist - 1, W); put(best - 1, L);
+        for(let k = 0; k < best; k++) insert(i + k);
+        i += best;
+      } else { put(1, 1); put(src[i], 8); insert(i); i++; }
+    }
+    if(nb) out[o++] = acc << (8 - nb);
+    return out.slice(0, o);
+  }
+
+  async function upload(k, cut, tail, mode){
+    const z = zOn(mode) ? hsCompress(k.data) : null;
+    const room = window.PRINTER.photoRoom || 0;
+    // Too big to hold right now: say so at once rather than retrying. Online
+    // only - at home the unit can close the online link to make room.
+    if(z && (z.length > 150 * 1024 || (window.REMOTE && room && z.length > room * 1.2 + 2048)))
+      throw new Error('too long for the printer (' + Math.ceil(z.length / 1024) + ' KB'
+        + (room ? ', room for about ' + Math.floor(room / 1024) + ' KB' : '')
+        + ') - crop it shorter or choose a narrower Width');
+    const url = (z ? '/api/print/rasterz' : '/api/print/raster') + '?width=' + k.width + '&rows=' + k.rows
+              + '&coverage=' + k.coverage + '&cut=' + (cut ? 1 : 0) + '&tail=' + (tail ? 1 : 0)
+              + (z ? '&z=' + z.length : '');
     for(let attempt = 0; ; attempt++){
       const fd = new FormData();
-      fd.append('data', new Blob([k.data], { type:'application/octet-stream' }), 'raster.bin');
+      fd.append('data', new Blob([z || k.data], { type:'application/octet-stream' }), 'raster.bin');
       try{ return (await window.api(url, { method:'POST', body: fd })).jobId; }
       catch(e){
         // Retry only what time can fix: no memory yet, a full queue, or a
         // dropped request. Anything else is a real refusal.
-        const busy = /out of memory|queue full|HTTP 5|fetch|network|load failed/i
-                       .test(e.message || '');
-        if(!busy || attempt >= 40 || cancel) throw e;
+        const msg = e.message || '';
+        const busy = /out of memory|queue full|HTTP 5|fetch|network|load failed/i.test(msg);
+        // v0.24.11: say what is happening, and give up on memory sooner
+        // (about 45 s) unless the printer is making room for it.
+        const mem = /out of memory/i.test(msg), making = /making room/i.test(msg);
+        if(!busy || cancel || attempt >= (mem && !making ? 12 : 40)){
+          if(mem && !making) throw new Error('too long for the printer\'s memory right now'
+            + ' - crop it shorter, choose a narrower Width, or try again in a minute');
+          throw e;
+        }
+        el('iprog').textContent = (making ? 'Making room on the printer'
+          : mem ? 'Waiting for printer memory' : 'Printer busy') + ', trying again (' + (attempt + 1) + ')\u2026';
         await new Promise(r => setTimeout(r, 3000));
       }
     }
@@ -428,14 +510,14 @@ static const char WEB_UI_IMAGE[] PROGMEM = R"HTML(
     for(let i = 0; i < photos.length && !cancel; i++){
       el('iprog').textContent = 'Sending ' + (i + 1) + ' of ' + photos.length + '\u2026';
       const ph = photos[i];
-      const parts = splitParts(pack(ph.img, false, ph.crop, ph.mode));
+      const parts = splitParts(pack(ph.img, false, ph.crop, ph.mode), ph.mode);
       try{
         let ok = true;
         for(let j = 0; j < parts.length && ok && !cancel; j++){
           const last = j === parts.length - 1;
           // Only the end gets the cut, and the white tail - and the tail
           // only for photos (it fixes a density step a document doesn't show).
-          const id = await upload(parts[j], last && el('icut').checked, last && ph.mode !== 'text');
+          const id = await upload(parts[j], last && el('icut').checked, last && ph.mode !== 'text', ph.mode);
           el('iprog').textContent = 'Printing ' + (i + 1) + ' of ' + photos.length
             + (parts.length > 1 ? ', part ' + (j + 1) + ' of ' + parts.length : '')
             + ' (job #' + id + ')\u2026';
@@ -568,6 +650,10 @@ static const char WEB_UI_IMAGE[] PROGMEM = R"HTML(
       render();
     });
     el('ifile').onchange = e => { addFiles(e.target.files); e.target.value = ''; };
+    el('icam').onchange = e => { addFiles(e.target.files); e.target.value = ''; };
+    el('icamb').onclick = () => el('icam').click();
+    // Phones and tablets (a touch screen as the main pointer) get the button.
+    try { if (matchMedia('(pointer: coarse)').matches) el('icamb').style.display = ''; } catch (e) {}
     drop.onclick = () => el('ifile').click();
     ['dragenter','dragover'].forEach(ev => drop.addEventListener(ev, e => {
       e.preventDefault(); drop.classList.add('over'); }));
@@ -659,8 +745,6 @@ static const char WEB_UI_IMAGE[] PROGMEM = R"HTML(
 
     window.onPrinterInfo = () => {
       takeDefaults();
-      if(window.PRINTER.maxImageBytes)
-        maxBytes = Math.min(HARD_MAX, window.PRINTER.maxImageBytes);
       if(photos.length && !running) queueRender();
     };
   });

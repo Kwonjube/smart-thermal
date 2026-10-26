@@ -72,6 +72,11 @@ public:
                       const uint8_t* data,
                       size_t len);
 
+  // Just the GS v 0 header. The caller then sends exactly widthBytes x rows
+  // pixel bytes with raw() - for an image held in pieces (v0.24.6). False if
+  // the header did not go out in full.
+  bool rasterHeader(RasterMode mode, uint16_t widthBytes, uint16_t rows);
+
   // --- Queries ---------------------------------------------------------
   // DLE EOT n, n = 1..4. REAL-TIME: the printer answers on receipt, ahead
   // of anything queued, even with its input buffer full. That is what makes

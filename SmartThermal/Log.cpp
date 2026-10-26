@@ -132,6 +132,7 @@ size_t LogTee::snapshot(char* out, size_t cap) {
 // Appends what is new in the ring to /trace.log. Runs on loop() only.
 void LogTee::save(bool now) {
   if (!_save) return;
+  if (_hold && !now) return;
   uint32_t pending;
   portENTER_CRITICAL(&s_mux);
   pending = s_written - s_saved;

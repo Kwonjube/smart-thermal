@@ -1,3 +1,4 @@
+#include "Mem.h"
 #include "Online.h"
 #include "OnlineKey.h"
 #include "RelaySession.h"
@@ -26,7 +27,11 @@ uint8_t  g_d[32];
 bool     g_haveKey = false;
 volatile Online::State g_state = Online::OFF;
 volatile bool g_restart = false, g_newCode = false, g_evWelcome = false;
-char     g_knock[3][33];
+volatile uint32_t g_roomUntil = 0;
+volatile bool g_ownerOff = false;            // Turn off pressed online (v0.26)
+            // makeRoom(): 0 = not holding
+bool roomHeld() { return g_roomUntil && (int32_t)(g_roomUntil - millis()) > 0; }
+char     g_knock[3][33], g_kDev[3][48], g_kLoc[3][64];
 uint8_t  g_knockN = 0;
 SlipDesk*   g_desk = nullptr;
 TaskHandle_t g_task = nullptr;
@@ -64,7 +69,8 @@ void load() {
   g_cfg.vis = p.getBool("vis", false);
   g_cfg.sec = p.getBool("sec", false);
   g_cfg.paused = p.getBool("pause", false);
-  strlcpy(g_cfg.host,  p.getString("host", RELAY_HOST).c_str(), sizeof(g_cfg.host));
+  // The relay address is fixed (v0.26): no longer a setting.
+  strlcpy(g_cfg.host, RELAY_HOST, sizeof(g_cfg.host));
   strlcpy(g_code,  p.getString("code", "").c_str(),  sizeof(g_code));
   strlcpy(g_url,   p.getString("url", "").c_str(),   sizeof(g_url));
   strlcpy(g_ocode, p.getString("oc", "").c_str(),    sizeof(g_ocode));
@@ -156,7 +162,7 @@ public:
     d["ownerHash"] = oh;
     // For the relay's admin log only: nothing here identifies a visitor.
     d["up"] = (uint32_t)(millis() / 1000);
-    d["heap"] = (uint32_t)ESP.getMaxAllocHeap();
+    d["heap"] = (uint32_t)Mem::block8();
     d["drops"] = g_drops;
     if (g_lastDrop[0]) d["last"] = g_lastDrop;
     serializeJson(d, json);
@@ -190,14 +196,23 @@ public:
     }
   }
 
-  void onNotice(const char* kind, const char* name) override {
+  void onNotice(const char* kind, const char* name) override { onNotice2(kind, name, "", ""); }
+  void onNotice2(const char* kind, const char* name, const char* dev, const char* loc) override {
     if (strcmp(kind, "device-request")) return;
     Lock l;
-    if (g_knockN < 3) strlcpy(g_knock[g_knockN++], (name && *name) ? name : "Someone", sizeof(g_knock[0]));
+    if (g_knockN < 3) {
+      strlcpy(g_knock[g_knockN], (name && *name) ? name : "Someone", sizeof(g_knock[0]));
+      strlcpy(g_kDev[g_knockN], dev ? dev : "", sizeof(g_kDev[0]));
+      strlcpy(g_kLoc[g_knockN], loc ? loc : "", sizeof(g_kLoc[0]));
+      g_knockN++;
+    }
     Log.printf("[online] %s asked to print here\n", name);
   }
+  // Turn off from the owner's page (v0.26): online printing goes off and
+  // stays off until switched back on in Settings at home.
+  void onOwnerOff() override { g_ownerOff = true; }
 
-  bool stopWanted() override { return g_restart || !g_cfg.en; }
+  bool stopWanted() override { return g_restart || !g_cfg.en || roomHeld() || g_ownerOff; }
   bool takeNewCode() override { if (!g_newCode) return false; g_newCode = false; return true; }
   Conn* loopback() override { return new LoopConn(); }
   void random(uint8_t* out, size_t n) override { OnlineKey::fill(out, n); }
@@ -228,8 +243,18 @@ const uint32_t BACKOFF_MIN = 2000, BACKOFF_MAX = 300000, BUSY_WAIT = 600000;
 void taskFn(void*) {
   uint32_t backoff = BACKOFF_MIN;
   uint32_t declinedAt = 0;
+  bool     roomLogged = false;
   for (;;) {
     if (!g_cfg.en) { setState(Online::OFF); g_restart = false; declinedAt = 0; delay(1000); continue; }
+    if (roomHeld()) {
+      if (!roomLogged) { Log.println("[online] link closed to make room for a home photo"); roomLogged = true; }
+      delay(250);
+      continue;
+    }
+    if (roomLogged) {
+      roomLogged = false; g_roomUntil = 0; backoff = BACKOFF_MIN;
+      Log.println("[online] photo done - reconnecting");
+    }
     if (g_restart) { g_restart = false; declinedAt = 0; backoff = BACKOFF_MIN; }
     if (declinedAt && millis() - declinedAt < DECLINED_MS) { delay(1000); continue; }
     declinedAt = 0;
@@ -245,7 +270,7 @@ void taskFn(void*) {
       if (p.begin(NS, false)) { p.putBytes("d", d, 32); p.end(); }
       { Lock l; memcpy(g_d, d, 32); g_haveKey = true; }
     }
-    if (ESP.getMaxAllocHeap() < MIN_HEAP) { delay(5000); continue; }   // a photo is in memory
+    if (Mem::block8() < MIN_HEAP) { delay(5000); continue; }   // a photo is in memory
 
     if (g_state != Online::PENDING && g_state != Online::ON) setState(Online::CONNECTING);
     char host[64];
@@ -284,6 +309,13 @@ void startTask() {
 
 }  // namespace
 
+void Online::makeRoom(uint32_t ms) {
+  if (!g_cfg.en) return;
+  g_roomUntil = (millis() + ms) | 1;
+}
+
+bool Online::makingRoom() { return roomHeld(); }
+
 // ----------------------------------------------------------------------
 // Public
 // ----------------------------------------------------------------------
@@ -298,6 +330,16 @@ void Online::begin(SlipDesk& desk, PrintQueue&) {
 }
 
 void Online::loop() {
+  // Turn off from the owner's page (v0.26): saved here, on loop(), like any
+  // other settings change. Stays off until switched on again at home.
+  if (g_ownerOff) {
+    Config c = config();
+    c.en = false;
+    String err;
+    save(c, err);
+    g_ownerOff = false;
+    Log.println("[online] turned off from the owner's page - switch it back on in Settings");
+  }
   if (!g_desk) return;
   if (g_evWelcome && !g_desk->busy(SlipDesk::ONLINE)) {
     char name[33], url[96], oc[8], key[24]; bool sec, vis;
@@ -311,15 +353,20 @@ void Online::loop() {
     if (url[0]) g_desk->wantOnline(name, url, oc, sec, vis, key);
   }
   if (g_knockN && !g_desk->busy(SlipDesk::KNOCK)) {
-    char who[33], name[33], url[96];
+    char who[33], name[33], url[96], dev[48], loc[64];
     {
       Lock l;
       strlcpy(who, g_knock[0], sizeof(who));
-      for (uint8_t i = 1; i < g_knockN; i++) strlcpy(g_knock[i - 1], g_knock[i], sizeof(g_knock[0]));
+      strlcpy(dev, g_kDev[0], sizeof(dev)); strlcpy(loc, g_kLoc[0], sizeof(loc));
+      for (uint8_t i = 1; i < g_knockN; i++) {
+        strlcpy(g_knock[i - 1], g_knock[i], sizeof(g_knock[0]));
+        strlcpy(g_kDev[i - 1], g_kDev[i], sizeof(g_kDev[0]));
+        strlcpy(g_kLoc[i - 1], g_kLoc[i], sizeof(g_kLoc[0]));
+      }
       g_knockN--;
       strlcpy(name, Online::name().c_str(), sizeof(name)); strlcpy(url, g_url, sizeof(url));
     }
-    g_desk->wantKnock(who, name, url);
+    g_desk->wantKnock(who, name, url, dev, loc);
   }
 }
 
@@ -327,13 +374,11 @@ Online::Config Online::config() { Lock l; return g_cfg; }
 
 bool Online::save(const Config& in, String& err) {
   Config c = in;
-  if (!c.host[0]) strlcpy(c.host, RELAY_HOST, sizeof(c.host));
-  for (const char* p = c.host; *p; p++)
-    if (!isalnum((unsigned char)*p) && *p != '.' && *p != '-') { err = "server name not valid"; return false; }
+  strlcpy(c.host, RELAY_HOST, sizeof(c.host));          // fixed (v0.26)
   Preferences p;
   if (!p.begin(NS, false)) { err = "storage"; return false; }
   p.putBool("en", c.en); p.putBool("vis", c.vis); p.putBool("sec", c.sec); p.putBool("pause", c.paused);
-  p.putString("host", c.host);
+  p.remove("host");
   {
     Lock l;
     if (c.en && !g_ocode[0]) { makeOwnerCode(g_ocode); p.putString("oc", g_ocode); }

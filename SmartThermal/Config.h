@@ -5,7 +5,7 @@
 #include <Arduino.h>
 
 // ---- Firmware ---------------------------------------------------------
-#define FIRMWARE_VERSION "0.24.2"
+#define FIRMWARE_VERSION "0.26.0"
 // Set by the compiler at build time. Never edit this by hand.
 #define FIRMWARE_DATE    __DATE__
 
@@ -95,3 +95,4 @@
 // printer a job that prints nothing, to see whether long quiet spells are
 // what makes it stop answering. 0 = off.
 #define KEEPAWAKE_HOURS 8
+
